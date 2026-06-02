@@ -13,24 +13,25 @@ from .text_encoder import TextEmbeddingProjector
 from .speaker_encoder import Qwen3TTSSpeakerEncoder, Qwen3TTSSpeakerEncoderConfig
 from .position_embeddings import DummyPositionEmbedding, LearnedPositionalEmbedding
 
+
+
 @dataclass
 class Text2SemanticConfig(PretrainedConfig):
-    """Configuration for the Text2Semantic model (speaker condition + text → semantic tokens).
+    """Configuration for Text2Semantic model.
 
-    Attributes:
-        num_layers: Number of transformer layers.
-        model_dim: Hidden dimension of the transformer.
-        num_heads: Number of attention heads.
-        max_text_seq_lens: Maximum number of text tokens.
-        max_semantic_seq_lens: Maximum number of semantic tokens.
-        vocab_size: Text vocabulary size.
-        semantic_vocab_size: Semantic token vocabulary size (includes BOS/EOS).
-        text_embedding_dim: Input dimension of the text embedding table.
-        speaker_embedding_dim: Input mel feature dimension for the speaker encoder.
-        start_semantic_token: BOS token index for the semantic sequence.
-        stop_semantic_token: EOS token index for the semantic sequence.
+    Args:
+        num_layers: Number of transformer layers
+        model_dim: Hidden dimension size
+        num_heads: Number of attention heads
+        max_text_seq_lens: Maximum text sequence length
+        max_semantic_seq_lens: Maximum semantic sequence length
+        vocab_size: Size of text vocabulary
+        semantic_vocab_size: Size of semantic token vocabulary
+        text_embedding_dim: Dimension of input text embeddings
+        speaker_embedding_dim: Dimension of speaker/style conditioning vector
+        start_semantic_token: BOS token ID for semantic sequence
+        stop_semantic_token: EOS token ID for semantic sequence
     """
-
     model_type = "text2semantic"
 
     num_layers: int = 24
@@ -113,13 +114,12 @@ class Text2Semantic(PreTrainedModel, GenerationMixin):
         )
         self.transformer = GPT2Model(gpt_config)
 
+        # Replace GPT2's position embedding with dummy (we use custom position embeddings)
         del self.transformer.wpe
         self.transformer.wpe = DummyPositionEmbedding(config.model_dim)
 
+        # Remove GPT2's word embedding (we use custom embedding concatenation)
         del self.transformer.wte
-
-        del self.transformer.ln_f
-        self.transformer.ln_f = nn.Identity()
 
         self.final_norm = nn.LayerNorm(config.model_dim)
         self.semantic_head = nn.Linear(config.model_dim, config.semantic_vocab_size)
@@ -130,6 +130,7 @@ class Text2Semantic(PreTrainedModel, GenerationMixin):
         )
         self.speaker_encoder = Qwen3TTSSpeakerEncoder(speaker_config)
 
+        # Caching for inference efficiency
         self.cached_condition_emb = None
         self.cached_text_emb = None
 
@@ -144,62 +145,61 @@ class Text2Semantic(PreTrainedModel, GenerationMixin):
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Build the inputs_embeds tensor that will be fed into the transformer.
+        """Prepare input embeddings by concatenating condition, text, and semantic embeddings.
+
+        Training mode (text_inputs provided):
+            Concatenates all three embedding types with their respective position encodings.
+
+        Inference mode (input_ids provided):
+            Uses cached condition and text embeddings, only computes new semantic embeddings.
+            Supports both full sequence and single-token (KV-cached) inputs.
 
         Args:
-            text_inputs: (batch, text_len) text token ids.
-            semantic_codes: (batch, sem_len) semantic token ids used in training.
-            condition_vector: (batch, mel_frames, speaker_dim) mel features for the speaker encoder.
-            input_ids: (batch, seq_len) token ids used during inference; the first
-            prefix_len positions are placeholder values replaced by cached embeddings.
-            attention_mask: (batch, total_len).
+            text_inputs: Text token IDs, shape (B, T_text)
+            semantic_codes: Semantic token IDs, shape (B, T_sem)
+            condition_vector: Speaker/style features, shape (B, T_cond, D_spk)
+            input_ids: Combined token IDs for inference, shape (B, T) or (B, 1)
+            attention_mask: Attention mask for inference, shape (B, T)
 
         Returns:
-            inputs_embeds: (batch, seq_len, model_dim) embedding tensor.
+            Concatenated embeddings, shape (B, T_total, D)
         """
         if text_inputs is not None:
-            # Training: build the full sequence [condition | text | semantic]
-            text_emb = self.text_projector(text_inputs)
+            # Training mode: full concatenation
+            text_emb = self.text_projector(text_inputs)  # (B, T_text, D)
             text_emb = self.text_position_embedding(text_emb)
 
-            semantic_emb = self.semantic_embedding(semantic_codes)
+            semantic_emb = self.semantic_embedding(semantic_codes)  # (B, T_sem, D)
             semantic_emb = self.semantic_position_embedding(semantic_emb)
 
-            condition_emb = self.speaker_encoder(condition_vector).unsqueeze(1)
+            condition_emb = self.speaker_encoder(condition_vector).unsqueeze(1)  # (B, 1, D)
 
             return torch.cat([condition_emb, text_emb, semantic_emb], dim=1)
 
         else:
-            assert self.cached_condition_emb is not None, "Call store_conditioning() first"
-            assert self.cached_text_emb is not None, "Call store_conditioning() first"
-
+            # Inference mode: use cached prefix
             condition_len = self.cached_condition_emb.shape[1]
             text_len = self.cached_text_emb.shape[1]
             prefix_len = condition_len + text_len
 
             if input_ids.shape[1] != 1:
+                # First inference step: full sequence
                 semantic_inputs = input_ids[:, prefix_len:]
                 semantic_emb = self.semantic_embedding(semantic_inputs)
                 semantic_emb = self.semantic_position_embedding(semantic_emb)
 
-                if self.cached_condition_emb.shape[0] != semantic_emb.shape[0]:
-                    condition_emb = self.cached_condition_emb.repeat_interleave(
-                        semantic_emb.shape[0] // self.cached_condition_emb.shape[0], 0
-                    )
-                    text_emb = self.cached_text_emb.repeat_interleave(
-                        semantic_emb.shape[0] // self.cached_text_emb.shape[0], 0
-                    )
-                else:
-                    condition_emb = self.cached_condition_emb
-                    text_emb = self.cached_text_emb
+                # Handle beam search batch expansion
+                repeat_factor = semantic_emb.shape[0] // self.cached_condition_emb.shape[0]
+                condition_emb = self.cached_condition_emb.repeat_interleave(repeat_factor, 0)
+                text_emb = self.cached_text_emb.repeat_interleave(repeat_factor, 0)
 
                 return torch.cat([condition_emb, text_emb, semantic_emb], dim=1)
 
             else:
-                semantic_emb = self.semantic_embedding(input_ids)
-                assert attention_mask is not None, (
-                    "attention_mask is required for single-token KV-cache decoding"
-                )
+                # KV-cached step: single token
+                semantic_emb = self.semantic_embedding(input_ids)  # (B, 1, D)
+
+                # Compute position for this single token
                 semantic_pos = attention_mask.shape[1] - prefix_len - 1
                 pos_emb = self.semantic_position_embedding.get_fixed_embedding(
                     semantic_pos, input_ids.device
@@ -225,12 +225,33 @@ class Text2Semantic(PreTrainedModel, GenerationMixin):
         condition_vector: Optional[torch.Tensor] = None,
         return_latent: bool = False,
     ):
-        """
-        Compute semantic token logits or latent hidden states for training and inference(return_latent=True).
+        """Forward pass for T2S model.
+
+        Training mode (text_inputs provided):
+            Computes loss for semantic token prediction given text and condition.
+
+        Inference mode (input_ids provided):
+            Generates logits for next semantic token, uses cached KV and embeddings.
+
+        Args:
+            input_ids: Token IDs for inference mode
+            attention_mask: Attention mask, shape (B, T)
+            past_key_values: Cached key/value states from previous steps
+            labels: Target semantic tokens for loss computation, shape (B, T_sem)
+            text_inputs: Text token IDs, shape (B, T_text)
+            text_lengths: Valid text lengths for each batch element, shape (B,)
+            semantic_codes: Semantic token IDs with BOS/EOS, shape (B, T_sem)
+            semantic_lengths: Valid semantic lengths (excluding BOS/EOS), shape (B,)
+            condition_vector: Speaker/style features, shape (B, T_cond, D_spk)
+            return_latent: If True, return hidden states instead of logits
+
+        Returns:
+            CausalLMOutputWithCrossAttentions with loss, logits, and hidden states
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if text_inputs is not None:
+            # Training mode
             inputs_embeds = self._prepare_embed_inputs(
                 text_inputs=text_inputs,
                 semantic_codes=semantic_codes,
@@ -238,6 +259,7 @@ class Text2Semantic(PreTrainedModel, GenerationMixin):
             )
 
             if attention_mask is None:
+                # Auto-generate attention mask from lengths
                 batch_size = text_inputs.shape[0]
                 device = text_inputs.device
                 cond_mask = torch.ones(batch_size, 1, dtype=torch.bool, device=device)
@@ -246,6 +268,7 @@ class Text2Semantic(PreTrainedModel, GenerationMixin):
                 attention_mask = torch.cat([cond_mask, text_mask, semantic_mask], dim=1)
 
         else:
+            # Inference mode
             inputs_embeds = self._prepare_embed_inputs(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -262,26 +285,25 @@ class Text2Semantic(PreTrainedModel, GenerationMixin):
             return_dict=return_dict,
         )
 
-        hidden_states = transformer_outputs.last_hidden_state
+        hidden_states = transformer_outputs.last_hidden_state  # (B, T_total, D)
 
         if return_latent:
-            # Strip the condition token (index 0) and the BOS/EOS semantic tokens
-            # (last two positions) to return only the interior semantic hidden states.
+            # Return latent representations (excluding condition and text prefix, and BOS/EOS)
             return hidden_states[:, 1 + text_inputs.shape[1]:-2]
 
         if text_inputs is not None:
-            # Skip the condition token ([:, 1:]) then skip text tokens to get only
-            # the semantic portion before projecting to logits.
+            # Training: extract semantic portion (skip condition token, then skip text)
             hidden_states = self.final_norm(hidden_states[:, 1:])[:, text_inputs.shape[1]:]
 
         else:
+            # Inference
             hidden_states = self.final_norm(hidden_states)
 
-        logits = self.semantic_head(hidden_states)
+        logits = self.semantic_head(hidden_states)  # (B, T_sem, vocab_size)
 
         loss = None
         if labels is not None:
-            logits_for_loss = logits.permute(0, 2, 1)
+            logits_for_loss = logits.permute(0, 2, 1)  # (B, vocab_size, T_sem)
             loss = F.cross_entropy(logits_for_loss, labels, ignore_index=-100)
 
         if not return_dict:
@@ -301,8 +323,13 @@ class Text2Semantic(PreTrainedModel, GenerationMixin):
         condition_vector: torch.Tensor,
         text_inputs: torch.Tensor
     ):
-        """
-        Pre-compute and cache speaker and text embeddings for reuse across decoding steps.
+        """Cache condition and text embeddings for efficient inference.
+
+        Avoids recomputing prefix embeddings during autoregressive generation.
+
+        Args:
+            condition_vector: Speaker/style features, shape (B, T_cond, D_spk)
+            text_inputs: Text token IDs, shape (B, T_text)
         """
         with torch.no_grad():
             condition_emb = self.speaker_encoder(condition_vector).unsqueeze(1)
@@ -318,12 +345,20 @@ class Text2Semantic(PreTrainedModel, GenerationMixin):
         past_key_values=None,
         **kwargs
     ):
-        """
-        Prepare model inputs for each generation step (HuggingFace GenerationMixin hook).
+        """Prepare inputs for HuggingFace generation interface.
+
+        Args:
+            input_ids: Current token sequence
+            past_key_values: Cached KV states
+            **kwargs: Additional generation arguments
+
+        Returns:
+            Dict with model inputs for next generation step
         """
         attention_mask = kwargs.get("attention_mask", None)
 
         if past_key_values:
+            # Use only last token when KV cache is available
             input_ids = input_ids[:, -1:]
 
         return {
@@ -335,6 +370,15 @@ class Text2Semantic(PreTrainedModel, GenerationMixin):
 
     @staticmethod
     def _reorder_cache(past_key_values, beam_idx):
+        """Reorder cached KV states for beam search.
+
+        Args:
+            past_key_values: Cached states for all layers
+            beam_idx: Beam indices to select
+
+        Returns:
+            Reordered cache
+        """
         return tuple(
             tuple(
                 past_state.index_select(0, beam_idx.to(past_state.device))
@@ -343,7 +387,7 @@ class Text2Semantic(PreTrainedModel, GenerationMixin):
             for layer_past in past_key_values
         )
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def generate(
         self,
         text_inputs: torch.Tensor,
@@ -354,34 +398,37 @@ class Text2Semantic(PreTrainedModel, GenerationMixin):
         top_p: float = 0.9,
         do_sample: bool = True,
         eos_token_id: Optional[int] = None,
+        return_latent: bool = False,
         **kwargs
-    ) -> torch.Tensor:
-        """Generate semantic token sequences from text and speaker condition.
+    ):
+        """Generate semantic tokens from text and condition autoregressively.
 
         Args:
-            text_inputs: (batch, text_len) text token ids.
-            condition_vector: (batch, mel_frames, speaker_dim) mel features for the speaker.
-            max_length: Maximum total sequence length passed to HuggingFace generate.
-            temperature: Sampling temperature.
-            top_k: Top-k sampling parameter.
-            top_p: Nucleus sampling parameter.
-            do_sample: If False, uses greedy decoding.
-            eos_token_id: EOS token to stop generation; defaults to stop_semantic_token.
-            **kwargs: Additional arguments forwarded to HuggingFace generate.
+            text_inputs: Text token IDs, shape (B, T_text)
+            condition_vector: Speaker/style features, shape (B, T_cond, D_spk)
+            max_length: Maximum total sequence length (prefix + generated tokens)
+            temperature: Sampling temperature (higher = more diverse)
+            top_k: Top-k sampling parameter
+            top_p: Nucleus sampling probability threshold
+            do_sample: Use sampling if True, greedy decoding if False
+            eos_token_id: Stop token ID (defaults to config.stop_semantic_token)
+            return_latent: If True, also return hidden state representations
+            **kwargs: Additional generation arguments (num_beams, etc.)
 
         Returns:
-            (batch, generated_len) tensor of semantic token indices, with the
-            placeholder prefix stripped from the HuggingFace generate output.
+            If return_latent=False: Semantic token IDs, shape (B, T_gen)
+            If return_latent=True: Dict with "semantic_codes" and "latent" (hidden states)
         """
         self.store_conditioning(condition_vector, text_inputs)
 
         batch_size = text_inputs.shape[0]
         device = text_inputs.device
-        
-        prefix_len = 1 + text_inputs.shape[1]
+        prefix_len = 1 + text_inputs.shape[1]  # condition(1) + text
 
         bos = self.config.start_semantic_token
         eos = eos_token_id if eos_token_id is not None else self.config.stop_semantic_token
+
+        # Initialize with BOS tokens for the semantic portion
         start_tokens = torch.full(
             (batch_size, prefix_len + 1),
             fill_value=bos,
@@ -390,6 +437,7 @@ class Text2Semantic(PreTrainedModel, GenerationMixin):
         )
         attention_mask = torch.ones(batch_size, prefix_len + 1, dtype=torch.long, device=device)
 
+        # Call HuggingFace generate
         generated = super().generate(
             start_tokens,
             attention_mask=attention_mask,
@@ -403,4 +451,104 @@ class Text2Semantic(PreTrainedModel, GenerationMixin):
             **kwargs
         )
 
-        return generated[:, prefix_len + 1:]
+        # Extract semantic tokens (remove prefix and BOS)
+        semantic_codes = generated[:, prefix_len + 1:]
+
+        if return_latent:
+            # Compute latent representations by forward pass
+            with torch.no_grad():
+                bos_col = torch.full(
+                    (batch_size, 1), bos, dtype=semantic_codes.dtype, device=device,
+                )
+                semantic_codes = torch.cat([bos_col, semantic_codes], dim=1)
+                inputs_embeds = self._prepare_embed_inputs(
+                    text_inputs=text_inputs,
+                    semantic_codes=semantic_codes,
+                    condition_vector=condition_vector,
+                )
+                text_lengths = torch.tensor([text_inputs.shape[1]], device=device)
+                semantic_lengths = torch.tensor([semantic_codes.shape[1] - 2], device=device)
+
+                cond_mask = torch.ones(batch_size, 1, dtype=torch.bool, device=device)
+                text_mask = torch.arange(text_inputs.shape[1], device=device).unsqueeze(0) < text_lengths.unsqueeze(1)
+                semantic_mask = torch.arange(semantic_codes.shape[1], device=device).unsqueeze(0) < (semantic_lengths + 2).unsqueeze(1)
+                attention_mask = torch.cat([cond_mask, text_mask, semantic_mask], dim=1)
+
+                transformer_outputs = self.transformer(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                    return_dict=True,
+                )
+
+                hidden_states = transformer_outputs.last_hidden_state
+                latent = hidden_states[:, 1 + text_inputs.shape[1]:-2]  # Extract semantic portion
+                semantic_codes = semantic_codes[:, 1:-1]  # Remove BOS/EOS
+
+            return {
+                "semantic_codes": semantic_codes,
+                "latent": latent
+            }
+
+        return semantic_codes
+
+
+if __name__ == "__main__":
+    print("Testing Text2Semantic...")
+
+    config = Text2SemanticConfig(
+        num_layers=2,
+        model_dim=128,
+        num_heads=2,
+    )
+    model = Text2Semantic(config)
+
+    print("\n=== Training Mode ===")
+    batch_size = 2
+    text_inputs = torch.randint(0, config.vocab_size, (batch_size, 10))
+    text_lengths = torch.tensor([10, 8])
+    semantic_codes = torch.randint(0, config.semantic_vocab_size, (batch_size, 20))
+    semantic_targets = torch.randint(0, config.semantic_vocab_size, (batch_size, 20))
+    semantic_lengths = torch.tensor([20, 18])
+    condition_vector = torch.randn(batch_size, 20, config.speaker_embedding_dim)
+
+    print("\nTest 1: Auto-generated attention_mask")
+    outputs = model(
+        text_inputs=text_inputs,
+        text_lengths=text_lengths,
+        semantic_codes=semantic_codes,
+        labels=semantic_targets,
+        semantic_lengths=semantic_lengths,
+        condition_vector=condition_vector,
+    )
+    print(f"Loss: {outputs.loss.item():.4f}")
+    print(f"Logits shape: {outputs.logits.shape}")
+
+    print("\nTest 2: Custom attention_mask")
+    custom_attention_mask = torch.ones(batch_size, 1 + 10 + 20, dtype=torch.bool)
+    custom_attention_mask[0, 15:] = False
+    custom_attention_mask[1, 20:] = False
+
+    outputs = model(
+        text_inputs=text_inputs,
+        attention_mask=custom_attention_mask,
+        semantic_codes=semantic_codes,
+        labels=semantic_targets,
+        condition_vector=condition_vector,
+    )
+    print(f"Loss: {outputs.loss.item():.4f}")
+    print(f"Logits shape: {outputs.logits.shape}")
+
+    print("\n=== Inference Mode ===")
+    model.eval()
+
+    semantic_tokens = model.generate(
+        text_inputs=text_inputs[:1],
+        condition_vector=condition_vector[:1],
+        max_length=20,
+        do_sample=False,
+    )
+    print(f"Generated shape: {semantic_tokens.shape}")
+    print(f"Generated tokens: {semantic_tokens[0]}")
+
+    print("\n✓ All tests passed!")

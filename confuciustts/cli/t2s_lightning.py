@@ -1,5 +1,4 @@
 import torch
-import torch.nn as nn
 import pytorch_lightning as L
 from pytorch_lightning.utilities.rank_zero import rank_zero_info
 from typing import Dict, Any
@@ -12,28 +11,26 @@ from confuciustts.utils.train_utils import get_optimizer, get_scheduler
 
 
 class T2SLightningModule(L.LightningModule):
-    """
-    Lightning module for Text2Semantic training.
+    """Lightning module for T2S model training.
 
-    Trains the language model to generate semantic codes from text and speaker conditioning.
-    """
+    Manages the full training pipeline including semantic feature extraction,
+    model forward pass, loss computation, and metric logging.
 
+    Args:
+        config: Training configuration dict with sections:
+            - t2s_model: Model architecture parameters
+            - paths: Checkpoint and model paths
+            - optimizer: Optimizer configuration
+            - scheduler: Learning rate scheduler configuration
+    """
     def __init__(self, config: Dict[str, Any]):
-        """
-        Initialize Text2Semantic Lightning module.
-
-        Args:
-            config: Configuration dictionary
-        """
         super().__init__()
         self.save_hyperparameters()
         self.config = config
 
-        # Initialize Text2Semantic model
-        model_config = Text2SemanticConfig(**config.get("model", {}))
+        model_config = Text2SemanticConfig(**config.get("t2s_model", {}))
         self.t2s_model = Text2Semantic(model_config)
 
-        # Load pretrained T2S weights if specified
         t2s_checkpoint = config.get("paths", {}).get("t2s_checkpoint")
         if t2s_checkpoint and os.path.isfile(t2s_checkpoint):
             rank_zero_info(f">> Loading pretrained T2S weights from: {t2s_checkpoint}")
@@ -45,8 +42,6 @@ class T2SLightningModule(L.LightningModule):
                 rank_zero_info(f">> T2S pretrained load - unexpected keys: {len(unexpected)}")
             rank_zero_info(f">> T2S pretrained weights loaded successfully")
 
-
-        # Initialize semantic model (frozen)
         w2v_bert_path = config["paths"]["w2v_bert_path"]
         self.semantic_extractor = load_semantic_extractor(
             w2v_bert_path,
@@ -56,7 +51,6 @@ class T2SLightningModule(L.LightningModule):
         for param in self.semantic_extractor.parameters():
             param.requires_grad = False
 
-        # Load semantic statistics for normalization
         w2v_stat_path = config.get("paths", {}).get("w2v_stat")
         if w2v_stat_path and os.path.exists(w2v_stat_path):
             stats = torch.load(w2v_stat_path)
@@ -66,34 +60,37 @@ class T2SLightningModule(L.LightningModule):
 
     @torch.no_grad()
     def get_semantic_embedding(self, input_features, attention_mask):
-        """
-        Extract semantic embeddings from audio features.
+        """Extract normalized semantic features from audio.
 
         Args:
-            input_features: Audio input features
-            attention_mask: Attention mask
+            input_features: Audio features from SeamlessM4T processor
+            attention_mask: Attention mask for variable-length audio
 
         Returns:
-            Normalized semantic features
+            Normalized layer 17 hidden states, shape (B, T, D)
         """
-        # Extract features using semantic model
         outputs = self.semantic_extractor.model(
             input_features=input_features,
             attention_mask=attention_mask,
             output_hidden_states=True,
         )
 
-        # Use 17th layer features
-        feat = outputs.hidden_states[17]  # (B, T, C)
+        feat = outputs.hidden_states[17]  # Layer 17 semantic features
 
-        # Normalize
         feat = (feat - self.semantic_mean.to(feat.device)) / self.semantic_std.to(feat.device)
 
         return feat
 
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
-        """Training step."""
-        # Extract batch
+        """Training step with teacher forcing.
+
+        Args:
+            batch: Batch dict with text_inputs, semantic_codes, etc.
+            batch_idx: Batch index
+
+        Returns:
+            Training loss
+        """
         text_inputs = batch["text_inputs"]
         text_lengths = batch["text_lengths"]
         semantic_codes = batch["semantic_codes"]
@@ -103,7 +100,6 @@ class T2SLightningModule(L.LightningModule):
         spk_attention_mask = batch["spk_attention_mask"]
         attention_mask = batch["attention_mask"]
 
-        # Extract speaker conditioning from semantic features
         with torch.no_grad():
             with torch.cuda.amp.autocast(enabled=True):
                 condition_vector = self.get_semantic_embedding(
@@ -111,7 +107,6 @@ class T2SLightningModule(L.LightningModule):
                     spk_attention_mask,
                 )
 
-        # GPT forward pass
         with torch.cuda.amp.autocast(enabled=True):
             outputs = self.t2s_model(
                 text_inputs=text_inputs,
@@ -126,14 +121,12 @@ class T2SLightningModule(L.LightningModule):
 
         loss = outputs.loss
 
-        # Calculate accuracy
         logits = outputs.logits
         predictions = torch.argmax(logits, dim=-1)
         mask = semantic_targets != -100
         correct = (predictions == semantic_targets) & mask
         accuracy = correct.sum().float() / mask.sum().float()
 
-        # Logging
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log("train_acc", accuracy, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log("lr", self.optimizers().param_groups[0]["lr"], on_step=True, prog_bar=True, sync_dist=True)
@@ -141,8 +134,15 @@ class T2SLightningModule(L.LightningModule):
         return loss
 
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
-        """Validation step."""
-        # Extract batch
+        """Validation step.
+
+        Args:
+            batch: Batch dict with text_inputs, semantic_codes, etc.
+            batch_idx: Batch index
+
+        Returns:
+            Validation loss
+        """
         text_inputs = batch["text_inputs"]
         text_lengths = batch["text_lengths"]
         semantic_codes = batch["semantic_codes"]
@@ -152,15 +152,13 @@ class T2SLightningModule(L.LightningModule):
         spk_attention_mask = batch["spk_attention_mask"]
         attention_mask = batch["attention_mask"]
 
-        # Extract speaker conditioning
-        with torch.inference_mode():
+        with torch.no_grad():
             with torch.cuda.amp.autocast(enabled=True):
                 condition_vector = self.get_semantic_embedding(
                     spk_input_features,
                     spk_attention_mask,
                 )
 
-        # GPT forward pass
         with torch.cuda.amp.autocast(enabled=True):
             outputs = self.t2s_model(
                 text_inputs=text_inputs,
@@ -174,30 +172,26 @@ class T2SLightningModule(L.LightningModule):
 
         loss = outputs.loss
 
-        # Calculate accuracy
         logits = outputs.logits
         predictions = torch.argmax(logits, dim=-1)
         mask = semantic_targets != -100
         correct = (predictions == semantic_targets) & mask
         accuracy = correct.sum().float() / mask.sum().float()
 
-        # Logging
         self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
         self.log("val_acc", accuracy, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
 
         return loss
 
     def on_save_checkpoint(self, checkpoint):
-        """
-        Customize checkpoint saving to only persist T2S model weights.
+        """Customize checkpoint saving to only include T2S model weights.
 
-        The frozen semantic model is excluded to keep checkpoint compact.
+        Args:
+            checkpoint: Checkpoint dict to be saved
         """
-        # Save only T2S model state dict
         t2s_state_dict = self.t2s_model.state_dict()
         checkpoint['state_dict'] = {f't2s_model.{k}': v for k, v in t2s_state_dict.items()}
 
-        # Remove unnecessary keys
         keys_to_remove = ['hyper_parameters']
         for key in keys_to_remove:
             if key in checkpoint:
@@ -206,12 +200,13 @@ class T2SLightningModule(L.LightningModule):
         rank_zero_info(f">> Checkpoint saved: {len(checkpoint['state_dict'])} t2s_model parameters")
 
     def on_load_checkpoint(self, checkpoint):
-        """
-        Customize checkpoint loading to handle optimized checkpoints.
+        """Load T2S model weights from checkpoint.
+
+        Args:
+            checkpoint: Checkpoint dict to load from
         """
         state_dict = checkpoint.get('state_dict', {})
 
-        # Extract T2S model keys
         t2s_keys = {k.replace('t2s_model.', ''): v for k, v in state_dict.items() if k.startswith('t2s_model.')}
 
         if t2s_keys:
@@ -224,23 +219,21 @@ class T2SLightningModule(L.LightningModule):
         else:
             rank_zero_info(f">> Warning: no t2s_model keys found in checkpoint!")
 
-        # Replace checkpoint state_dict with current model state_dict
         checkpoint['state_dict'] = self.state_dict()
 
     def configure_optimizers(self):
-        """Configure optimizer and learning rate scheduler."""
+        """Configure optimizer and learning rate scheduler.
+
+        Returns:
+            Dict with optimizer and lr_scheduler configuration
+        """
         params = [p for p in self.t2s_model.parameters() if p.requires_grad]
 
         optimizer_cfg = self.config.get("optimizer", {})
         rank_zero_info(f">> Optimizer: {len(params)} trainable parameters")
 
         optimizer = get_optimizer(params, **optimizer_cfg)
-
-        # Create scheduler
-        scheduler = get_scheduler(
-            optimizer,
-            **self.config.get("scheduler", {}),
-        )
+        scheduler = get_scheduler(optimizer, **self.config.get("scheduler", {}))
 
         return {
             "optimizer": optimizer,

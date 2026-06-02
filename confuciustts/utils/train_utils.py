@@ -1,10 +1,3 @@
-"""
-Training utilities for optimization and learning rate scheduling.
-
-Provides utilities for configuring optimizers, learning rate schedulers,
-and training helpers.
-"""
-
 import math
 import torch
 from torch.optim import Optimizer, AdamW
@@ -24,20 +17,6 @@ def get_optimizer(
     betas: tuple = (0.9, 0.95),
     eps: float = 1e-8,
 ) -> Optimizer:
-    """
-    Create optimizer for model training.
-
-    Args:
-        model_parameters: Model parameters to optimize
-        optimizer_type: Type of optimizer ("adamw", "adam")
-        learning_rate: Learning rate
-        weight_decay: Weight decay coefficient
-        betas: Adam beta parameters
-        eps: Adam epsilon
-
-    Returns:
-        Optimizer instance
-    """
     if optimizer_type.lower() == "adamw":
         optimizer = AdamW(
             model_parameters,
@@ -67,19 +46,6 @@ def get_scheduler(
     num_training_steps: int = 100000,
     **kwargs,
 ):
-    """
-    Create learning rate scheduler using transformers library.
-
-    Args:
-        optimizer: Optimizer to schedule
-        scheduler_type: Type of scheduler ("cosine", "linear", "constant")
-        num_warmup_steps: Number of warmup steps
-        num_training_steps: Total number of training steps
-        **kwargs: Additional scheduler arguments
-
-    Returns:
-        Learning rate scheduler
-    """
     if scheduler_type.lower() == "cosine":
         return get_cosine_schedule_with_warmup(
             optimizer=optimizer,
