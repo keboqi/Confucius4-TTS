@@ -19,8 +19,8 @@
     &nbsp;&nbsp;&nbsp;&nbsp;
 </div>
 <br>
-Confucius4-TTS is an advanced LLM-based text-to-speech (TTS) system designed for multilingual and cross-lingual speech synthesis. Built on a speech encoder + large language model (LLM) architecture, Confucius4-TTS enables high-quality speech generation while preserving speaker identity across languages.
-you can try our online demo at [https://confucius4-tts.youdao.com/gradio](https://confucius4-tts.youdao.com/gradio).
+
+Confucius4-TTS is an advanced LLM-based text-to-speech (TTS) system designed for multilingual and cross-lingual speech synthesis. Built on a speech encoder + large language model (LLM) architecture, Confucius4-TTS enables high-quality speech generation while preserving speaker identity across languages. You can try our online demo at **[https://confucius4-tts.youdao.com/gradio](https://confucius4-tts.youdao.com/gradio)**.
 
 **✨ Key Features**
 
