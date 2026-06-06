@@ -5,7 +5,7 @@ seed:
 
 paths:
   tokenizer_path: ./checkpoints
-  w2v_bert_path: pretrained/w2v-bert-2.0
+  w2v_bert_path: facebook/w2v-bert-2.0
   w2v_stat: ./checkpoints/wav2vec2bert_stats.pt
 
   style_encoder:
@@ -13,11 +13,11 @@ paths:
     init_args:
       feat_dim: 80
       embedding_size: 192
-    checkpoint: ./pretrained/campplus/campplus_cn_common.bin
+    checkpoint: campplus_cn_common.bin
 
   vocoder_path: nvidia/bigvgan_v2_22khz_80band_256x
-  t2s_checkpoint: ./checkpoints/t2s_model.safetensors
-  s2a_checkpoint: ./checkpoints/s2a_model.pt
+  t2s_checkpoint: t2s_model.safetensors
+  s2a_checkpoint: s2a_model.pt
 
 # ===================== Model Configuration (T2S) =====================
 t2s_model:
