@@ -8,6 +8,7 @@ import torch
 import torchaudio
 import yaml
 from transformers import AutoTokenizer, SeamlessM4TFeatureExtractor, Wav2Vec2BertModel
+from huggingface_hub import hf_hub_download
 
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _PROJECT_ROOT not in sys.path:
@@ -71,7 +72,10 @@ class ConfuciusTTS:
 
         spk_cfg = paths["style_encoder"]
         self.style_encoder = CAMPPlus(**spk_cfg.get("init_args", {}))
-        spk_state = torch.load(spk_cfg["checkpoint"], map_location="cpu")
+        style_encoder_path = hf_hub_download(
+            "funasr/campplus", filename=spk_cfg["checkpoint"]
+        )
+        spk_state = torch.load(style_encoder_path, map_location="cpu")
         if isinstance(spk_state, dict) and "state_dict" in spk_state:
             spk_state = spk_state["state_dict"]
         self.style_encoder.load_state_dict(spk_state, strict=False)
@@ -81,15 +85,22 @@ class ConfuciusTTS:
         t2s_config = Text2SemanticConfig(**self.cfg["t2s_model"])
         self.t2s_model = Text2Semantic(t2s_config)
         self.t2s_model.config.vocab_size = t2s_config.semantic_vocab_size
+
+        t2s_model_path = hf_hub_download(
+            "netease-youdao/Confucius4-TTS", filename=paths["t2s_checkpoint"]
+        )
         self.t2s_model.load_state_dict(
-            safetensors.torch.load_file(paths["t2s_checkpoint"], device="cpu")
+            safetensors.torch.load_file(t2s_model_path, device="cpu")
         )
         self.t2s_model.eval().to(self.device)
 
         s2a_config = MaskedDiffWithXvecConfig(**self.cfg["s2a_model"])
         self.s2a_model = MaskedDiffWithXvec(s2a_config)
+        s2a_model_path = hf_hub_download(
+            "netease-youdao/Confucius4-TTS", filename=paths["s2a_checkpoint"]
+        )
         self.s2a_model.load_state_dict(
-            torch.load(paths["s2a_checkpoint"], map_location="cpu", weights_only=False)
+            torch.load(s2a_model_path, map_location="cpu", weights_only=False)
         )
         self.s2a_model.eval().to(self.device)
 
