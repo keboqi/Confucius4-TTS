@@ -51,7 +51,7 @@ Video Demo
       <video src="https://github.com/user-attachments/assets/e00ae5e1-fbb0-4137-af13-dd53599196a5" controls width="100%"></video>
     </td>
     <td>
-      <video src="https://github.com/user-attachments/assets/8d382707-ba99-4bf3-9866-13d339db490f" controls width="100%"></video>
+      <video src="https://github.com/user-attachments/assets/f6c1aabb-4258-40ba-b945-81c3eeed67c3" controls width="100%"></video>
     </td>
   </tr>
 </table>
