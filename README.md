@@ -119,6 +119,15 @@ The UI accepts a reference audio file, synthesis text, language selection,
 and advanced generation settings. Generated WAV files are saved under
 `outputs/gradio/`.
 
+If `transformers` fails while importing `Wav2Vec2BertModel` with an error like
+`operator torchvision::nms does not exist`, the Python environment has a
+Torch/TorchVision mismatch. Reinstall the matching package set:
+
+```bash
+pip install --force-reinstall torch==2.7.0 torchaudio==2.7.0 torchvision==0.22.0
+pip install -r requirements.txt
+```
+
 You can also use the Python API directly:
 
 ```python

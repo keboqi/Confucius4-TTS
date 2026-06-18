@@ -10,7 +10,7 @@ import sys
 import time
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import gradio as gr
 import torch
@@ -21,9 +21,6 @@ OUTPUT_DIR = ROOT_DIR / "outputs" / "gradio"
 
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
-
-from confuciustts.cli.inference import ConfuciusTTS
-
 
 LANGUAGE_CHOICES = [
     "en - English",
@@ -76,7 +73,16 @@ def _normalize_checkpoint(value: str) -> Optional[str]:
 
 
 @lru_cache(maxsize=4)
-def _load_model(config_path: str, t2s_checkpoint: Optional[str], device: str) -> ConfuciusTTS:
+def _load_model(config_path: str, t2s_checkpoint: Optional[str], device: str) -> Any:
+    try:
+        from confuciustts.cli.inference import ConfuciusTTS
+    except Exception as exc:
+        raise gr.Error(
+            "Could not import ConfuciusTTS. Reinstall the matching Torch packages with "
+            "`pip install --force-reinstall torch==2.7.0 torchaudio==2.7.0 torchvision==0.22.0`, "
+            "then run `pip install -r requirements.txt` again."
+        ) from exc
+
     return ConfuciusTTS(
         config_path=config_path,
         t2s_checkpoint=t2s_checkpoint,
