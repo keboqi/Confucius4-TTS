@@ -61,10 +61,32 @@ def _resolve_repo_path(value: str, label: str, must_exist: bool = True) -> str:
 
 def _resolve_device(device_choice: str) -> str:
     if device_choice == "auto":
-        return "cuda" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available():
+            _ensure_cuda_usable()
+            return "cuda"
+        return "cpu"
     if device_choice == "cuda" and not torch.cuda.is_available():
         raise gr.Error("CUDA was selected, but torch.cuda.is_available() is false.")
+    if device_choice == "cuda":
+        _ensure_cuda_usable()
     return device_choice
+
+
+def _ensure_cuda_usable() -> None:
+    try:
+        device_name = torch.cuda.get_device_name(0)
+        major, minor = torch.cuda.get_device_capability(0)
+        _ = torch.ones(1, device="cuda") + 1
+        torch.cuda.synchronize()
+    except Exception as exc:
+        raise gr.Error(
+            "CUDA is visible, but this PyTorch build cannot run kernels on the GPU. "
+            f"Detected GPU: {locals().get('device_name', 'unknown')} "
+            f"(sm_{locals().get('major', '?')}{locals().get('minor', '?')}). "
+            "For Blackwell GPUs such as RTX PRO 6000, reinstall PyTorch with the CUDA 12.8 wheels: "
+            "`pip install --force-reinstall -r requirements-cu128.txt`. "
+            "If stable CUDA 12.8 wheels still fail, install the PyTorch nightly CUDA 12.8 build."
+        ) from exc
 
 
 def _normalize_checkpoint(value: str) -> Optional[str]:
