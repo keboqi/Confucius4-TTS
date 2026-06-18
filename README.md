@@ -124,8 +124,8 @@ If `transformers` fails while importing `Wav2Vec2BertModel` with an error like
 Torch/TorchVision mismatch. Reinstall the matching package set:
 
 ```bash
-pip install --force-reinstall -r requirements-cu128.txt
 pip install -r requirements.txt
+pip install --force-reinstall -r requirements-cu128.txt
 ```
 
 On Blackwell GPUs such as RTX PRO 6000, a PyTorch build that only supports
@@ -134,16 +134,16 @@ architectures through `sm_90` can fail during generation with
 Install the CUDA 12.8 PyTorch wheel first:
 
 ```bash
-pip install --force-reinstall -r requirements-cu128.txt
 pip install -r requirements.txt
+pip install --force-reinstall -r requirements-cu128.txt
 ```
 
 If the stable CUDA 12.8 wheel still does not include your GPU architecture, use
 the PyTorch nightly CUDA 12.8 wheel:
 
 ```bash
-pip install --pre --force-reinstall torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
 pip install -r requirements.txt
+pip install --pre --force-reinstall torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
 ```
 
 You can also use the Python API directly:
