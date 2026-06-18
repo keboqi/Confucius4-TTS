@@ -107,6 +107,18 @@ python example.py \
     --config config/inference_config.yaml
 ```
 
+### Gradio Web UI
+
+Launch the local Gradio interface:
+
+```bash
+python gradio_app.py --server-name 127.0.0.1 --server-port 7860
+```
+
+The UI accepts a reference audio file, synthesis text, language selection,
+and advanced generation settings. Generated WAV files are saved under
+`outputs/gradio/`.
+
 You can also use the Python API directly:
 
 ```python

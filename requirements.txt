@@ -41,3 +41,4 @@ packaging==26.0
 filelock==3.25.2
 fsspec==2026.2.0
 protobuf==3.19.6
+gradio>=4.44.1
