@@ -351,19 +351,13 @@ class ConfuciusText2SemanticForCausalLM(nn.Module, SupportsPP, SupportsMultiModa
         positions: torch.Tensor,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        pos_embeds = torch.zeros(
-            (*positions.shape, self.config.n_embd),
-            device=positions.device,
-            dtype=dtype,
-        )
         valid = positions >= 0
-        if valid.any():
-            max_pos = self.semantic_position_embedding.embedding.num_embeddings - 1
-            semantic_positions = positions[valid].clamp(max=max_pos)
-            pos_embeds[valid] = self.semantic_position_embedding.embedding(
-                semantic_positions
-            ).to(dtype=dtype)
-        return pos_embeds
+        max_pos = self.semantic_position_embedding.embedding.num_embeddings - 1
+        semantic_positions = positions.clamp(min=0, max=max_pos)
+        pos_embeds = self.semantic_position_embedding.embedding(
+            semantic_positions
+        ).to(dtype=dtype)
+        return pos_embeds * valid.unsqueeze(-1).to(dtype=dtype)
 
     def forward(
         self,
