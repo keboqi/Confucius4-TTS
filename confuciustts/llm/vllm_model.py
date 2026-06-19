@@ -225,11 +225,11 @@ class ConfuciusGPT2Model(nn.Module):
         self.embed_dim = config.n_embd
         self.start_layer, self.end_layer, self.h = make_layers(
             config.n_layer,
-            lambda layer_prefix: GPT2Block(
+            lambda prefix: GPT2Block(
                 config,
                 cache_config,
                 quant_config,
-                prefix=layer_prefix,
+                prefix=prefix,
             ),
             prefix=f"{prefix}.h",
         )
