@@ -49,10 +49,16 @@ def parse_args():
                    help="Beam search width (1 = greedy decoding)")
     p.add_argument("--repetition-penalty", type=float, default=10.0,
                    help="Penalty for repeating tokens (higher = less repetition)")
+    p.add_argument("--max-length", type=int, default=1520,
+                   help="Maximum semantic token sequence length")
     p.add_argument("--diffusion-steps", type=int, default=25,
                    help="Number of diffusion steps for S2A (more = higher quality, slower)")
     p.add_argument("--cfg-strength", type=float, default=0.7,
                    help="Classifier-free guidance scale (higher = stronger conditioning)")
+    p.add_argument("--max-text-tokens", type=int, default=80,
+                   help="Maximum tokenizer tokens per text segment")
+    p.add_argument("--cross-fade-duration", type=float, default=0.3,
+                   help="Cross-fade duration between generated segments")
     p.add_argument("--verbose", action="store_true",
                    help="Print processing information")
     return p.parse_args()
@@ -81,8 +87,11 @@ def main():
         top_k=args.top_k,
         num_beams=args.num_beams,
         repetition_penalty=args.repetition_penalty,
+        max_length=args.max_length,
         n_timesteps=args.diffusion_steps,
         inference_cfg_rate=args.cfg_strength,
+        max_text_tokens_per_segment=args.max_text_tokens,
+        cross_fade_duration=args.cross_fade_duration,
         verbose=args.verbose,
     )
     dt = time.time() - t0

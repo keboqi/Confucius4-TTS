@@ -6,8 +6,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -19,11 +19,9 @@ import torchaudio
 ROOT_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = ROOT_DIR / "outputs" / "gradio"
 SERVE_MODEL: Any = None
-ORIGINAL_MODEL: Any = None
 SERVE_DEVICE = "cuda"
 SERVE_CONFIG_PATH: Optional[str] = None
 SERVE_T2S_CHECKPOINT: Optional[str] = None
-ORIGINAL_MODEL_LOCK = threading.Lock()
 
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
@@ -152,58 +150,10 @@ def _load_serving_model(
     )
 
 
-def _load_original_model(
-    config_path: str,
-    t2s_checkpoint: Optional[str],
-    device: str,
-) -> Any:
-    try:
-        from confuciustts.cli.inference import ConfuciusTTS
-    except Exception as exc:
-        raise gr.Error(
-            "Could not import ConfuciusTTS. Reinstall the matching Torch packages with "
-            "`pip install --force-reinstall torch==2.7.0 torchaudio==2.7.0 torchvision==0.22.0`, "
-            "then run `pip install -r requirements.txt` again."
-        ) from exc
-
-    return ConfuciusTTS(
-        config_path=config_path,
-        t2s_checkpoint=t2s_checkpoint,
-        device=device,
-    )
-
-
 def _vllm_model() -> Any:
     if SERVE_MODEL is None:
         raise gr.Error("The vLLM TTS model is not loaded.")
     return SERVE_MODEL
-
-
-def _original_model() -> Any:
-    global ORIGINAL_MODEL
-
-    if ORIGINAL_MODEL is not None:
-        return ORIGINAL_MODEL
-    if SERVE_CONFIG_PATH is None:
-        raise gr.Error("The original PyTorch TTS model is not configured.")
-
-    with ORIGINAL_MODEL_LOCK:
-        if ORIGINAL_MODEL is None:
-            print(
-                "[Confucius4-TTS] Loading original PyTorch T2S backend "
-                f"on {SERVE_DEVICE}..."
-            )
-            ORIGINAL_MODEL = _load_original_model(
-                config_path=SERVE_CONFIG_PATH,
-                t2s_checkpoint=SERVE_T2S_CHECKPOINT,
-                device=SERVE_DEVICE,
-            )
-            print("[Confucius4-TTS] Original PyTorch TTS model is ready.")
-    return ORIGINAL_MODEL
-
-
-def _model(use_vllm: bool) -> Any:
-    return _vllm_model() if use_vllm else _original_model()
 
 
 def _output_path(prompt_wav: str, backend: str) -> Path:
@@ -243,6 +193,122 @@ def _format_timing_status(
     return "\n".join(lines)
 
 
+def _original_subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    pythonpath = env.get("PYTHONPATH")
+    paths = pythonpath.split(os.pathsep) if pythonpath else []
+    root = str(ROOT_DIR)
+    if root not in paths:
+        env["PYTHONPATH"] = os.pathsep.join([root, *paths])
+    return env
+
+
+def _format_subprocess_error(process: subprocess.CompletedProcess[str]) -> str:
+    parts = [
+        f"Original PyTorch generation failed with exit code {process.returncode}."
+    ]
+    if process.stdout.strip():
+        parts.extend(["", "stdout:", process.stdout.strip()])
+    if process.stderr.strip():
+        parts.extend(["", "stderr:", process.stderr.strip()])
+    return "\n".join(parts)
+
+
+def _synthesize_original_subprocess(
+    prompt_wav: str,
+    text: str,
+    lang: str,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    num_beams: int,
+    repetition_penalty: float,
+    max_length: int,
+    diffusion_steps: int,
+    cfg_strength: float,
+    max_text_tokens: int,
+    cross_fade_duration: float,
+    verbose: bool,
+) -> tuple[str, str, str]:
+    if SERVE_CONFIG_PATH is None:
+        raise gr.Error("The original PyTorch TTS model is not configured.")
+
+    output = _output_path(prompt_wav, "pytorch")
+    command = [
+        sys.executable,
+        "-m",
+        "confuciustts.cli.run_inference",
+        "--text",
+        text,
+        "--lang",
+        lang,
+        "--prompt-wav",
+        prompt_wav,
+        "--output",
+        str(output),
+        "--config",
+        SERVE_CONFIG_PATH,
+        "--device",
+        SERVE_DEVICE,
+        "--temperature",
+        str(float(temperature)),
+        "--top-p",
+        str(float(top_p)),
+        "--top-k",
+        str(int(top_k)),
+        "--num-beams",
+        str(int(num_beams)),
+        "--repetition-penalty",
+        str(float(repetition_penalty)),
+        "--max-length",
+        str(int(max_length)),
+        "--diffusion-steps",
+        str(int(diffusion_steps)),
+        "--cfg-strength",
+        str(float(cfg_strength)),
+        "--max-text-tokens",
+        str(int(max_text_tokens)),
+        "--cross-fade-duration",
+        str(float(cross_fade_duration)),
+    ]
+    if SERVE_T2S_CHECKPOINT is not None:
+        command.extend(["--t2s-checkpoint", SERVE_T2S_CHECKPOINT])
+    if verbose:
+        command.append("--verbose")
+
+    started = time.perf_counter()
+    process = subprocess.run(
+        command,
+        cwd=str(ROOT_DIR),
+        env=_original_subprocess_env(),
+        capture_output=True,
+        text=True,
+    )
+    request_elapsed = time.perf_counter() - started
+    if process.returncode != 0:
+        raise gr.Error(_format_subprocess_error(process))
+    if not output.exists():
+        raise gr.Error(
+            "Original PyTorch generation finished without creating the output file."
+        )
+
+    info = torchaudio.info(str(output))
+    generated_seconds = info.num_frames / info.sample_rate
+    status_lines = [
+        (
+            f"Original PyTorch T2S generated {generated_seconds:.2f}s "
+            f"of audio in {request_elapsed:.2f}s on {SERVE_DEVICE}."
+        ),
+        f"saved={output}",
+        "",
+        "Subprocess output:",
+        process.stdout.strip() or "(no stdout)",
+    ]
+    if process.stderr.strip():
+        status_lines.extend(["", "Subprocess stderr:", process.stderr.strip()])
+    return str(output), str(output), "\n".join(status_lines)
+
+
 def _synthesize(
     use_vllm: bool,
     prompt_wav: Optional[str],
@@ -270,8 +336,26 @@ def _synthesize(
         raise gr.Error("Enter text to synthesize.")
 
     lang = _language_code(language)
-    model = _model(use_vllm)
-    backend_slug = "vllm" if use_vllm else "pytorch"
+    if not use_vllm:
+        return _synthesize_original_subprocess(
+            prompt_wav=prompt_wav,
+            text=text,
+            lang=lang,
+            temperature=float(temperature),
+            top_p=float(top_p),
+            top_k=int(top_k),
+            num_beams=int(num_beams),
+            repetition_penalty=float(repetition_penalty),
+            max_length=int(max_length),
+            diffusion_steps=int(diffusion_steps),
+            cfg_strength=float(cfg_strength),
+            max_text_tokens=int(max_text_tokens),
+            cross_fade_duration=float(cross_fade_duration),
+            verbose=bool(verbose),
+        )
+
+    model = _vllm_model()
+    backend_slug = "vllm"
 
     started = time.perf_counter()
     audio, timing_info = model.generate(

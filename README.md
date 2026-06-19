@@ -118,12 +118,18 @@ python example.py \
 ### Gradio vLLM Service
 
 Launch the local Gradio interface. The Gradio entry point loads a single
-long-lived vLLM-backed T2S engine at startup and reuses it for all requests:
+long-lived vLLM-backed T2S engine at startup and reuses it for vLLM requests.
+The "Generate original" button runs the original PyTorch backend in an isolated
+subprocess so it does not share runtime state with the vLLM engine:
 
 ```bash
+sudo apt install ffmpeg
 pip install -r requirements.txt
 pip install --force-reinstall -r requirements-cu128.txt
 pip install -r requirements-vllm.txt
+pip install "numpy<2"
+pip install "https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
+pip install "torchcodec==0.9.*"
 
 python tools/convert_t2s_vllm.py \
     --config config/inference_config.yaml \
