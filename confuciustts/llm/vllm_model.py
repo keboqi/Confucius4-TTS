@@ -113,6 +113,17 @@ class ConfuciusTTSDataParser(MultiModalDataParser):
 class ConfuciusTTSMultiModalProcessor(
     BaseMultiModalProcessor[ConfuciusTTSProcessingInfo]
 ):
+    def _call_hf_processor(
+        self,
+        prompt: str,
+        mm_data: Mapping[str, object],
+        mm_kwargs: Mapping[str, object],
+        tok_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        return BatchFeature(
+            {"input_ids": [[PLACEHOLDER_TOKEN_ID] * len(prompt)]}
+        )
+
     def _get_mm_fields_config(
         self,
         hf_inputs: BatchFeature,
@@ -138,7 +149,7 @@ class ConfuciusTTSMultiModalProcessor(
         return [
             PromptReplacement(
                 modality="audio",
-                target=PLACEHOLDER_TOKEN_ID,
+                target=[PLACEHOLDER_TOKEN_ID],
                 replacement=get_replacement,
             )
         ]
