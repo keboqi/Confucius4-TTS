@@ -94,6 +94,14 @@ conda activate confuciustts
 pip install -r requirements.txt
 ```
 
+For RTX PRO 6000 Blackwell deployment, install the CUDA 12.8 PyTorch wheels
+after the base dependencies:
+
+```bash
+pip install -r requirements.txt
+pip install --force-reinstall -r requirements-cu128.txt
+```
+
 ## 🚀 Inference
 
 Use the provided `example.py` script for zero-shot TTS synthesis:
@@ -107,21 +115,53 @@ python example.py \
     --config config/inference_config.yaml
 ```
 
-### Gradio Web UI
+### Gradio vLLM Service
 
-Launch the local Gradio interface:
+Launch the local Gradio interface. The Gradio entry point loads a single
+long-lived vLLM-backed T2S engine at startup and reuses it for all requests:
 
 ```bash
-python gradio_app.py --server-name 127.0.0.1 --server-port 7860
+pip install -r requirements.txt
+pip install --force-reinstall -r requirements-cu128.txt
+pip install -r requirements-vllm.txt
+
+python tools/convert_t2s_vllm.py \
+    --config config/inference_config.yaml \
+    --output checkpoints/t2s-vllm
+
+python gradio_app.py \
+    --server-name 0.0.0.0 \
+    --server-port 7860 \
+    --device cuda \
+    --config config/inference_config.yaml \
+    --vllm-model-dir checkpoints/t2s-vllm \
+    --vllm-gpu-memory-utilization 0.25 \
+    --concurrency-limit 100
 ```
 
 The UI accepts a reference audio file, synthesis text, language selection,
 and advanced generation settings. Generated WAV files are saved under
 `outputs/gradio/`.
 
+### vLLM T2S Backend
+
+The vLLM path accelerates only the autoregressive Text2Semantic stage. Reference
+audio encoding, S2A diffusion, and BigVGAN remain in PyTorch.
+
+The converted T2S directory is required before starting the service:
+
+```bash
+python tools/convert_t2s_vllm.py \
+    --config config/inference_config.yaml \
+    --output checkpoints/t2s-vllm
+```
+
+For API servers or Gradio queues, concurrent requests can share the same vLLM
+engine so semantic decoding is batched by vLLM.
+
 If `transformers` fails while importing `Wav2Vec2BertModel` with an error like
 `operator torchvision::nms does not exist`, the Python environment has a
-Torch/TorchVision mismatch. Reinstall the matching package set:
+Torch/TorchVision mismatch. Reinstall the matching CUDA 12.8 package set:
 
 ```bash
 pip install -r requirements.txt
@@ -129,9 +169,9 @@ pip install --force-reinstall -r requirements-cu128.txt
 ```
 
 On Blackwell GPUs such as RTX PRO 6000, a PyTorch build that only supports
-architectures through `sm_90` can fail during generation with
+older architectures can fail during generation with
 `CUDA error: no kernel image is available for execution on the device`.
-Install the CUDA 12.8 PyTorch wheel first:
+Use the CUDA 12.8 PyTorch wheel set:
 
 ```bash
 pip install -r requirements.txt

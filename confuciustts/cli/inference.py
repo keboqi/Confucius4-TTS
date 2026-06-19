@@ -44,8 +44,14 @@ class ConfuciusTTS:
         config_path: str = "config/inference_config.yaml",
         t2s_checkpoint: Optional[str] = None,
         device: str = "cuda",
+        use_vllm: bool = False,
+        vllm_model_dir: Optional[str] = None,
+        vllm_gpu_memory_utilization: float = 0.25,
+        vllm_tensor_parallel_size: int = 1,
+        vllm_dtype: str = "auto",
     ):
         self.device = torch.device(device)
+        self.t2s_vllm = None
 
         with open(config_path, "r", encoding="utf-8") as f:
             self.cfg = yaml.safe_load(f)
@@ -93,6 +99,18 @@ class ConfuciusTTS:
             safetensors.torch.load_file(t2s_model_path, device="cpu")
         )
         self.t2s_model.eval().to(self.device)
+        if use_vllm:
+            if vllm_model_dir is None:
+                vllm_model_dir = paths.get("t2s_vllm_dir", "./checkpoints/t2s-vllm")
+            from confuciustts.llm.vllm_runtime import Text2SemanticVLLM
+
+            self.t2s_vllm = Text2SemanticVLLM(
+                self.t2s_model,
+                model_dir=vllm_model_dir,
+                gpu_memory_utilization=vllm_gpu_memory_utilization,
+                tensor_parallel_size=vllm_tensor_parallel_size,
+                dtype=vllm_dtype,
+            )
 
         s2a_config = MaskedDiffWithXvecConfig(**self.cfg["s2a_model"])
         self.s2a_model = MaskedDiffWithXvec(s2a_config)
@@ -223,7 +241,8 @@ class ConfuciusTTS:
         formatted = f"You are a helpful assistant. {lang_token}:{text}"
         token_ids = self.tokenizer.encode(formatted, return_tensors="pt").to(self.device)
 
-        t2s_out = self.t2s_model.generate(
+        t2s_backend = self.t2s_vllm if self.t2s_vllm is not None else self.t2s_model
+        t2s_out = t2s_backend.generate(
             text_inputs=token_ids,
             condition_vector=semantic_features,
             max_length=max_length,
@@ -357,6 +376,13 @@ def main():
     parser.add_argument("--config", type=str, default="config/inference_config.yaml")
     parser.add_argument("--t2s_checkpoint", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--use_vllm", action="store_true",
+                        help="Use vLLM for the autoregressive T2S semantic decoder.")
+    parser.add_argument("--vllm_model_dir", type=str, default=None,
+                        help="Converted T2S vLLM directory from tools/convert_t2s_vllm.py.")
+    parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.25)
+    parser.add_argument("--vllm_tensor_parallel_size", type=int, default=1)
+    parser.add_argument("--vllm_dtype", type=str, default="auto")
     parser.add_argument("--cross_fade_duration", type=float, default=0.3)
     parser.add_argument("--edge_fade_duration", type=float, default=0.1)
     parser.add_argument("--edge_pad_duration", type=float, default=0.1)
@@ -367,6 +393,11 @@ def main():
         config_path=args.config,
         t2s_checkpoint=args.t2s_checkpoint,
         device=args.device,
+        use_vllm=args.use_vllm,
+        vllm_model_dir=args.vllm_model_dir,
+        vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+        vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
+        vllm_dtype=args.vllm_dtype,
     )
     audio = model.generate(
         args.text, args.lang, args.prompt_wav,

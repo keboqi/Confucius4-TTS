@@ -40,5 +40,6 @@ tqdm==4.67.3
 packaging==26.0
 filelock==3.25.2
 fsspec==2026.2.0
-protobuf==3.19.6
+# vLLM 0.16.x and current HF/gRPC stacks need protobuf 5.x.
+protobuf>=5.29.6,<6.0.0
 gradio>=4.44.1

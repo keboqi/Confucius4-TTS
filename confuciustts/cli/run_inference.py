@@ -27,6 +27,16 @@ def parse_args():
                    help="Override T2S checkpoint path from config")
     p.add_argument("--device", type=str, default="cuda",
                    help="Device for inference (cuda or cpu)")
+    p.add_argument("--use-vllm", action="store_true",
+                   help="Use vLLM for the autoregressive T2S semantic decoder")
+    p.add_argument("--vllm-model-dir", type=str, default=None,
+                   help="Converted T2S vLLM directory from tools/convert_t2s_vllm.py")
+    p.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.25,
+                   help="vLLM GPU memory utilization")
+    p.add_argument("--vllm-tensor-parallel-size", type=int, default=1,
+                   help="vLLM tensor parallel size")
+    p.add_argument("--vllm-dtype", type=str, default="auto",
+                   help="vLLM dtype argument")
     p.add_argument("--temperature", type=float, default=0.8,
                    help="Sampling temperature for T2S generation (higher = more diverse)")
     p.add_argument("--top-p", type=float, default=0.8,
@@ -52,6 +62,11 @@ def main():
         config_path=args.config,
         t2s_checkpoint=args.t2s_checkpoint,
         device=args.device,
+        use_vllm=args.use_vllm,
+        vllm_model_dir=args.vllm_model_dir,
+        vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+        vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
+        vllm_dtype=args.vllm_dtype,
     )
     t0 = time.time()
     audio = model.generate(

@@ -17,6 +17,7 @@ paths:
 
   vocoder_path: nvidia/bigvgan_v2_22khz_80band_256x
   t2s_checkpoint: t2s_model.safetensors
+  t2s_vllm_dir: ./checkpoints/t2s-vllm
   s2a_checkpoint: s2a_model.pt
 
 # ===================== Model Configuration (T2S) =====================

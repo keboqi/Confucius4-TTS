@@ -8,7 +8,6 @@ import hashlib
 import os
 import sys
 import time
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
 
@@ -18,6 +17,8 @@ import torchaudio
 
 ROOT_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = ROOT_DIR / "outputs" / "gradio"
+SERVE_MODEL: Any = None
+SERVE_DEVICE = "cuda"
 
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
@@ -59,6 +60,21 @@ def _resolve_repo_path(value: str, label: str, must_exist: bool = True) -> str:
     return str(path)
 
 
+def _resolve_repo_dir(value: str, label: str, must_exist: bool = True) -> str:
+    value = value.strip()
+    if not value:
+        raise gr.Error(f"{label} is required.")
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = ROOT_DIR / path
+    path = path.resolve()
+    if must_exist and not path.exists():
+        raise gr.Error(f"{label} does not exist: {path}")
+    if must_exist and not path.is_dir():
+        raise gr.Error(f"{label} must be a directory: {path}")
+    return str(path)
+
+
 def _resolve_device(device_choice: str) -> str:
     if device_choice == "auto":
         if torch.cuda.is_available():
@@ -94,8 +110,15 @@ def _normalize_checkpoint(value: str) -> Optional[str]:
     return value or None
 
 
-@lru_cache(maxsize=4)
-def _load_model(config_path: str, t2s_checkpoint: Optional[str], device: str) -> Any:
+def _load_serving_model(
+    config_path: str,
+    t2s_checkpoint: Optional[str],
+    device: str,
+    vllm_model_dir: str,
+    vllm_gpu_memory_utilization: float,
+    vllm_tensor_parallel_size: int,
+    vllm_dtype: str,
+) -> Any:
     try:
         from confuciustts.cli.inference import ConfuciusTTS
     except Exception as exc:
@@ -109,7 +132,18 @@ def _load_model(config_path: str, t2s_checkpoint: Optional[str], device: str) ->
         config_path=config_path,
         t2s_checkpoint=t2s_checkpoint,
         device=device,
+        use_vllm=True,
+        vllm_model_dir=vllm_model_dir,
+        vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
+        vllm_tensor_parallel_size=vllm_tensor_parallel_size,
+        vllm_dtype=vllm_dtype,
     )
+
+
+def _model() -> Any:
+    if SERVE_MODEL is None:
+        raise gr.Error("The vLLM-backed TTS model is not loaded.")
+    return SERVE_MODEL
 
 
 def _output_path(prompt_wav: str) -> Path:
@@ -123,9 +157,6 @@ def synthesize(
     prompt_wav: Optional[str],
     text: str,
     language: str,
-    device_choice: str,
-    config_path: str,
-    t2s_checkpoint: str,
     temperature: float,
     top_p: float,
     top_k: int,
@@ -147,12 +178,8 @@ def synthesize(
     if not text:
         raise gr.Error("Enter text to synthesize.")
 
-    config = _resolve_repo_path(config_path, "Config")
-    device = _resolve_device(device_choice)
-    checkpoint = _normalize_checkpoint(t2s_checkpoint)
     lang = _language_code(language)
-
-    model = _load_model(config, checkpoint, device)
+    model = _model()
 
     started = time.time()
     audio = model.generate(
@@ -179,16 +206,9 @@ def synthesize(
     elapsed = time.time() - started
     status = (
         f"Generated {generated_seconds:.2f}s of audio in {elapsed:.2f}s "
-        f"on {device}. Saved to {output}."
+        f"on {SERVE_DEVICE} with vLLM T2S. Saved to {output}."
     )
     return str(output), str(output), status
-
-
-def clear_model_cache() -> str:
-    _load_model.cache_clear()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    return "Model cache cleared."
 
 
 def build_demo() -> gr.Blocks:
@@ -206,11 +226,6 @@ def build_demo() -> gr.Blocks:
                     choices=LANGUAGE_CHOICES,
                     value=LANGUAGE_CHOICES[0],
                 )
-                device_choice = gr.Radio(
-                    label="Device",
-                    choices=["auto", "cuda", "cpu"],
-                    value="auto",
-                )
 
             with gr.Column(scale=2):
                 text = gr.Textbox(
@@ -221,7 +236,6 @@ def build_demo() -> gr.Blocks:
                 )
                 with gr.Row():
                     generate_btn = gr.Button("Generate", variant="primary")
-                    clear_btn = gr.Button("Clear model cache")
 
         with gr.Accordion("Generation settings", open=False):
             with gr.Row():
@@ -238,16 +252,7 @@ def build_demo() -> gr.Blocks:
                 max_text_tokens = gr.Slider(20, 240, value=80, step=5, label="Segment token limit")
             cross_fade_duration = gr.Slider(0.0, 2.0, value=0.3, step=0.05, label="Cross fade seconds")
 
-        with gr.Accordion("Model loading", open=False):
-            config_path = gr.Textbox(
-                label="Config path",
-                value="config/inference_config.yaml",
-            )
-            t2s_checkpoint = gr.Textbox(
-                label="T2S checkpoint filename override",
-                value="",
-                placeholder="Leave blank to use config/inference_config.yaml",
-            )
+        with gr.Accordion("Server settings", open=False):
             verbose = gr.Checkbox(label="Verbose inference logs", value=False)
 
         output_audio = gr.Audio(label="Generated audio", type="filepath")
@@ -260,9 +265,6 @@ def build_demo() -> gr.Blocks:
                 prompt_wav,
                 text,
                 language,
-                device_choice,
-                config_path,
-                t2s_checkpoint,
                 temperature,
                 top_p,
                 top_k,
@@ -277,7 +279,6 @@ def build_demo() -> gr.Blocks:
             ],
             outputs=[output_audio, output_file, status],
         )
-        clear_btn.click(fn=clear_model_cache, outputs=status)
 
     return demo
 
@@ -289,11 +290,52 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--share", action="store_true")
     parser.add_argument("--inbrowser", action="store_true")
     parser.add_argument("--root-path", default=os.getenv("GRADIO_ROOT_PATH"))
+    parser.add_argument("--config", default=os.getenv("CONFUCIUS_TTS_CONFIG", "config/inference_config.yaml"))
+    parser.add_argument("--t2s-checkpoint", default=os.getenv("CONFUCIUS_T2S_CHECKPOINT", ""))
+    parser.add_argument("--device", default=os.getenv("CONFUCIUS_TTS_DEVICE", "cuda"),
+                        choices=["auto", "cuda", "cpu"])
+    parser.add_argument("--vllm-model-dir", default=os.getenv("CONFUCIUS_T2S_VLLM_DIR", "checkpoints/t2s-vllm"))
+    parser.add_argument("--vllm-gpu-memory-utilization", type=float,
+                        default=float(os.getenv("CONFUCIUS_VLLM_GPU_MEMORY_UTILIZATION", "0.25")))
+    parser.add_argument("--vllm-tensor-parallel-size", type=int,
+                        default=int(os.getenv("CONFUCIUS_VLLM_TENSOR_PARALLEL_SIZE", "1")))
+    parser.add_argument("--vllm-dtype", default=os.getenv("CONFUCIUS_VLLM_DTYPE", "auto"))
+    parser.add_argument("--concurrency-limit", type=int,
+                        default=int(os.getenv("GRADIO_CONCURRENCY_LIMIT", "100")))
     return parser.parse_args()
 
 
 def main() -> None:
+    global SERVE_DEVICE, SERVE_MODEL
+
     args = parse_args()
+    config_path = _resolve_repo_path(args.config, "Config")
+    vllm_model_dir = _resolve_repo_dir(args.vllm_model_dir, "T2S vLLM directory")
+    SERVE_DEVICE = _resolve_device(args.device)
+    if SERVE_DEVICE != "cuda":
+        raise gr.Error(
+            "The Gradio serving entry point requires CUDA because it always "
+            "uses the vLLM T2S backend."
+        )
+    if args.concurrency_limit < 1:
+        raise gr.Error("--concurrency-limit must be at least 1.")
+    t2s_checkpoint = _normalize_checkpoint(args.t2s_checkpoint)
+
+    print(
+        "[Confucius4-TTS] Loading always-on vLLM T2S backend "
+        f"from {vllm_model_dir} on {SERVE_DEVICE}..."
+    )
+    SERVE_MODEL = _load_serving_model(
+        config_path=config_path,
+        t2s_checkpoint=t2s_checkpoint,
+        device=SERVE_DEVICE,
+        vllm_model_dir=vllm_model_dir,
+        vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+        vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
+        vllm_dtype=args.vllm_dtype,
+    )
+    print("[Confucius4-TTS] vLLM-backed TTS model is ready.")
+
     launch_kwargs = {
         "server_name": args.server_name,
         "server_port": args.server_port,
@@ -303,7 +345,7 @@ def main() -> None:
     if args.root_path:
         launch_kwargs["root_path"] = args.root_path
 
-    build_demo().queue(default_concurrency_limit=1).launch(**launch_kwargs)
+    build_demo().queue(default_concurrency_limit=args.concurrency_limit).launch(**launch_kwargs)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,7 @@
+# Optional backend for accelerated Confucius4-TTS Text2Semantic decoding.
+# Target: RTX PRO 6000 Blackwell on Linux with CUDA 12.8 PyTorch wheels.
+# Install after requirements.txt and requirements-cu128.txt.
+vllm==0.16.0
+
+# Keep protobuf aligned with vLLM/gRPC while avoiding protobuf 6 churn.
+protobuf>=5.29.6,<6.0.0
