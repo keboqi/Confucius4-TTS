@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import time
+import wave
 from pathlib import Path
 from typing import Any, Optional
 
@@ -292,8 +293,8 @@ def _synthesize_original_subprocess(
             "Original PyTorch generation finished without creating the output file."
         )
 
-    info = torchaudio.info(str(output))
-    generated_seconds = info.num_frames / info.sample_rate
+    with wave.open(str(output), "rb") as wav_file:
+        generated_seconds = wav_file.getnframes() / wav_file.getframerate()
     status_lines = [
         (
             f"Original PyTorch T2S generated {generated_seconds:.2f}s "
