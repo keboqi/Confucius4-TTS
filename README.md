@@ -139,13 +139,20 @@ python gradio_app.py \
     --concurrency-limit 100
 ```
 
+`requirements-vllm.txt` also installs this repository in editable mode. This
+registers the Confucius custom T2S model as a `vllm.general_plugins` entry
+point, which is required because the Gradio service uses spawned vLLM engine
+workers.
+
 By default vLLM selects the first compatible attention backend. On Blackwell
 this normally means FlashInfer first, then FlashAttention, then Triton. The
-vLLM requirements pin `flashinfer-python`; avoid installing `flash-attn` by
-hand in the deployment environment unless the system CUDA toolkit matches the
-CUDA version used by PyTorch. For example, PyTorch `+cu128` with a CUDA 13.0
-`nvcc` will make `flash-attn` fall back to a source build and fail with a CUDA
-version mismatch.
+vLLM requirements pin `flashinfer-python`. If you explicitly need to test
+`FLASH_ATTN`, use a matching prebuilt wheel from
+[mjun0812/flash-attention-prebuild-wheels](https://github.com/mjun0812/flash-attention-prebuild-wheels)
+instead of source-building `flash-attn`. Match the wheel to the deployment
+Python, CUDA/PyTorch, CXX11 ABI, and Linux platform tuple. For example, PyTorch
+`+cu128` with a CUDA 13.0 `nvcc` will make `pip install flash-attn` fall back
+to a source build and fail with a CUDA version mismatch.
 
 To force an attention backend for testing, add one of:
 

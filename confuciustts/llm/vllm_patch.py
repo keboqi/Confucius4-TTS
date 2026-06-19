@@ -2,28 +2,26 @@
 
 from __future__ import annotations
 
-from typing import Any
+_CONFUCIUS_MODEL_ARCH = "ConfuciusText2SemanticForCausalLM"
+_CONFUCIUS_MODEL_REF = (
+    "confuciustts.llm.vllm_model:ConfuciusText2SemanticForCausalLM"
+)
 
 
 def register_confucius_vllm_model() -> None:
     """Register the custom T2S model and patch vLLM positions once."""
     from vllm import ModelRegistry
 
-    from confuciustts.llm.vllm_model import ConfuciusText2SemanticForCausalLM
-
     try:
-        ModelRegistry.register_model(
-            "ConfuciusText2SemanticForCausalLM",
-            ConfuciusText2SemanticForCausalLM,
-        )
+        ModelRegistry.register_model(_CONFUCIUS_MODEL_ARCH, _CONFUCIUS_MODEL_REF)
     except Exception as exc:
         if "already" not in str(exc).lower():
             raise
 
-    _patch_gpu_model_runner_positions(ConfuciusText2SemanticForCausalLM)
+    _patch_gpu_model_runner_positions()
 
 
-def _patch_gpu_model_runner_positions(model_cls: type[Any]) -> None:
+def _patch_gpu_model_runner_positions() -> None:
     """Make vLLM semantic positions start at BOS instead of prompt index 0.
 
     vLLM positions count the entire prompt, but Confucius's semantic position
@@ -54,7 +52,7 @@ def _patch_gpu_model_runner_positions(model_cls: type[Any]) -> None:
         )
 
         model = self.get_model()
-        if not isinstance(model, model_cls):
+        if model.__class__.__name__ != _CONFUCIUS_MODEL_ARCH:
             return result
 
         total = scheduler_output.total_num_scheduled_tokens

@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=77.0.3", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "confucius4-tts"
+version = "0.1.0"
+description = "Confucius4-TTS with optional vLLM serving support"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+
+[project.entry-points."vllm.general_plugins"]
+confucius4_tts = "confuciustts.llm.vllm_plugin:register"
+
+[tool.setuptools.packages.find]
+include = ["confuciustts*", "external*"]

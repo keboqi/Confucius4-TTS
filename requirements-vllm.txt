@@ -1,6 +1,9 @@
 # Optional backend for accelerated Confucius4-TTS Text2Semantic decoding.
 # Target: RTX PRO 6000 Blackwell on Linux with CUDA 12.8 PyTorch wheels.
 # Install after requirements.txt and requirements-cu128.txt.
+# Registers the Confucius vLLM plugin entry point for spawned engine workers.
+-e .
+
 vllm==0.16.0
 
 # vLLM's CUDA path prefers FlashInfer on Blackwell before FlashAttention.

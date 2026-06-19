@@ -8,6 +8,7 @@ import os
 import threading
 import uuid
 import warnings
+from importlib.metadata import entry_points
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -16,6 +17,10 @@ import torch
 from confuciustts.llm.llm import Text2Semantic
 from confuciustts.llm.vllm_model import PLACEHOLDER_TOKEN, PLACEHOLDER_TOKEN_ID
 from confuciustts.llm.vllm_patch import register_confucius_vllm_model
+
+
+_CONFUCIUS_VLLM_PLUGIN_NAME = "confucius4_tts"
+_CONFUCIUS_VLLM_PLUGIN_REF = "confuciustts.llm.vllm_plugin:register"
 
 
 class _BackgroundLoop:
@@ -53,7 +58,8 @@ class Text2SemanticVLLM:
         max_model_len: Optional[int] = None,
         engine_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
-        os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "fork")
+        os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+        _ensure_confucius_vllm_plugin_entrypoint()
         register_confucius_vllm_model()
 
         from vllm import SamplingParams
@@ -314,6 +320,43 @@ class Text2SemanticVLLM:
         )
         hidden_states = transformer_outputs.last_hidden_state
         return hidden_states[:, 1 + text_inputs.shape[1] : -2]
+
+
+def _ensure_confucius_vllm_plugin_entrypoint() -> None:
+    installed = False
+    try:
+        eps = entry_points()
+        if hasattr(eps, "select"):
+            plugin_eps = eps.select(group="vllm.general_plugins")
+        else:
+            plugin_eps = eps.get("vllm.general_plugins", ())
+        installed = any(
+            ep.name == _CONFUCIUS_VLLM_PLUGIN_NAME
+            and ep.value == _CONFUCIUS_VLLM_PLUGIN_REF
+            for ep in plugin_eps
+        )
+    except Exception:
+        installed = False
+
+    if not installed:
+        raise RuntimeError(
+            "Confucius4-TTS vLLM mode uses spawned vLLM engine workers. "
+            "Install this repository first so vLLM can load the custom model "
+            "plugin in child processes: run `pip install -e .` or "
+            "`pip install -r requirements-vllm.txt` from the repository root."
+        )
+
+    enabled_plugins = os.environ.get("VLLM_PLUGINS")
+    if enabled_plugins:
+        names = {
+            name.strip()
+            for name in enabled_plugins.replace(";", ",").split(",")
+            if name.strip()
+        }
+        if _CONFUCIUS_VLLM_PLUGIN_NAME not in names:
+            os.environ["VLLM_PLUGINS"] = (
+                f"{enabled_plugins},{_CONFUCIUS_VLLM_PLUGIN_NAME}"
+            )
 
 
 def _filter_kwargs(callable_obj: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
