@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 import threading
 import uuid
 import warnings
@@ -51,6 +52,7 @@ class Text2SemanticVLLM:
         max_model_len: Optional[int] = None,
         engine_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
+        os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "fork")
         register_confucius_vllm_model()
 
         from vllm import SamplingParams
@@ -67,7 +69,7 @@ class Text2SemanticVLLM:
         self.torch_model = torch_model
         self.model_dir = str(Path(model_dir))
         self.SamplingParams = SamplingParams
-        self._loop = _BackgroundLoop()
+        self._loop: Optional[_BackgroundLoop] = None
 
         args: Dict[str, Any] = {
             "model": self.model_dir,
@@ -247,6 +249,8 @@ class Text2SemanticVLLM:
         return {"semantic_codes": semantic_codes, "latent": latent}
 
     def generate(self, *args: Any, **kwargs: Any):
+        if self._loop is None:
+            self._loop = _BackgroundLoop()
         return self._loop.run(self.async_generate(*args, **kwargs))
 
     @torch.no_grad()

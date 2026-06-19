@@ -75,15 +75,16 @@ def _resolve_repo_dir(value: str, label: str, must_exist: bool = True) -> str:
     return str(path)
 
 
-def _resolve_device(device_choice: str) -> str:
+def _resolve_device(device_choice: str, probe_cuda: bool = True) -> str:
     if device_choice == "auto":
         if torch.cuda.is_available():
-            _ensure_cuda_usable()
+            if probe_cuda:
+                _ensure_cuda_usable()
             return "cuda"
         return "cpu"
     if device_choice == "cuda" and not torch.cuda.is_available():
         raise gr.Error("CUDA was selected, but torch.cuda.is_available() is false.")
-    if device_choice == "cuda":
+    if device_choice == "cuda" and probe_cuda:
         _ensure_cuda_usable()
     return device_choice
 
@@ -311,7 +312,8 @@ def main() -> None:
     args = parse_args()
     config_path = _resolve_repo_path(args.config, "Config")
     vllm_model_dir = _resolve_repo_dir(args.vllm_model_dir, "T2S vLLM directory")
-    SERVE_DEVICE = _resolve_device(args.device)
+    # Avoid creating a CUDA context before the vLLM engine has forked.
+    SERVE_DEVICE = _resolve_device(args.device, probe_cuda=False)
     if SERVE_DEVICE != "cuda":
         raise gr.Error(
             "The Gradio serving entry point requires CUDA because it always "

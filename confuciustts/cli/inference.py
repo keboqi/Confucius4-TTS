@@ -70,6 +70,34 @@ class ConfuciusTTS:
 
         self.normalizer = TextNormalizer()
 
+        # Start vLLM before any CUDA context is created so forked engine
+        # processes inherit the custom Confucius model registration.
+        self.tokenizer = AutoTokenizer.from_pretrained(paths["tokenizer_path"])
+        t2s_config = Text2SemanticConfig(**self.cfg["t2s_model"])
+        self.t2s_model = Text2Semantic(t2s_config)
+        self.t2s_model.config.vocab_size = t2s_config.semantic_vocab_size
+
+        t2s_model_path = hf_hub_download(
+            "netease-youdao/Confucius4-TTS", filename=paths["t2s_checkpoint"]
+        )
+        self.t2s_model.load_state_dict(
+            safetensors.torch.load_file(t2s_model_path, device="cpu")
+        )
+        self.t2s_model.eval()
+        if use_vllm:
+            if vllm_model_dir is None:
+                vllm_model_dir = paths.get("t2s_vllm_dir", "./checkpoints/t2s-vllm")
+            from confuciustts.llm.vllm_runtime import Text2SemanticVLLM
+
+            self.t2s_vllm = Text2SemanticVLLM(
+                self.t2s_model,
+                model_dir=vllm_model_dir,
+                gpu_memory_utilization=vllm_gpu_memory_utilization,
+                tensor_parallel_size=vllm_tensor_parallel_size,
+                dtype=vllm_dtype,
+            )
+        self.t2s_model.to(self.device)
+
         self.feature_extractor = SeamlessM4TFeatureExtractor.from_pretrained(paths["w2v_bert_path"])
         self.w2v_model = Wav2Vec2BertModel.from_pretrained(paths["w2v_bert_path"]).eval().to(self.device)
         stats = torch.load(paths["w2v_stat"], map_location="cpu")
@@ -86,31 +114,6 @@ class ConfuciusTTS:
             spk_state = spk_state["state_dict"]
         self.style_encoder.load_state_dict(spk_state, strict=False)
         self.style_encoder.eval().to(self.device)
-
-        self.tokenizer = AutoTokenizer.from_pretrained(paths["tokenizer_path"])
-        t2s_config = Text2SemanticConfig(**self.cfg["t2s_model"])
-        self.t2s_model = Text2Semantic(t2s_config)
-        self.t2s_model.config.vocab_size = t2s_config.semantic_vocab_size
-
-        t2s_model_path = hf_hub_download(
-            "netease-youdao/Confucius4-TTS", filename=paths["t2s_checkpoint"]
-        )
-        self.t2s_model.load_state_dict(
-            safetensors.torch.load_file(t2s_model_path, device="cpu")
-        )
-        self.t2s_model.eval().to(self.device)
-        if use_vllm:
-            if vllm_model_dir is None:
-                vllm_model_dir = paths.get("t2s_vllm_dir", "./checkpoints/t2s-vllm")
-            from confuciustts.llm.vllm_runtime import Text2SemanticVLLM
-
-            self.t2s_vllm = Text2SemanticVLLM(
-                self.t2s_model,
-                model_dir=vllm_model_dir,
-                gpu_memory_utilization=vllm_gpu_memory_utilization,
-                tensor_parallel_size=vllm_tensor_parallel_size,
-                dtype=vllm_dtype,
-            )
 
         s2a_config = MaskedDiffWithXvecConfig(**self.cfg["s2a_model"])
         self.s2a_model = MaskedDiffWithXvec(s2a_config)
