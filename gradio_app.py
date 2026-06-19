@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -18,7 +19,11 @@ import torchaudio
 ROOT_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = ROOT_DIR / "outputs" / "gradio"
 SERVE_MODEL: Any = None
+ORIGINAL_MODEL: Any = None
 SERVE_DEVICE = "cuda"
+SERVE_CONFIG_PATH: Optional[str] = None
+SERVE_T2S_CHECKPOINT: Optional[str] = None
+ORIGINAL_MODEL_LOCK = threading.Lock()
 
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
@@ -147,10 +152,58 @@ def _load_serving_model(
     )
 
 
-def _model() -> Any:
+def _load_original_model(
+    config_path: str,
+    t2s_checkpoint: Optional[str],
+    device: str,
+) -> Any:
+    try:
+        from confuciustts.cli.inference import ConfuciusTTS
+    except Exception as exc:
+        raise gr.Error(
+            "Could not import ConfuciusTTS. Reinstall the matching Torch packages with "
+            "`pip install --force-reinstall torch==2.7.0 torchaudio==2.7.0 torchvision==0.22.0`, "
+            "then run `pip install -r requirements.txt` again."
+        ) from exc
+
+    return ConfuciusTTS(
+        config_path=config_path,
+        t2s_checkpoint=t2s_checkpoint,
+        device=device,
+    )
+
+
+def _vllm_model() -> Any:
     if SERVE_MODEL is None:
-        raise gr.Error("The TTS model is not loaded.")
+        raise gr.Error("The vLLM TTS model is not loaded.")
     return SERVE_MODEL
+
+
+def _original_model() -> Any:
+    global ORIGINAL_MODEL
+
+    if ORIGINAL_MODEL is not None:
+        return ORIGINAL_MODEL
+    if SERVE_CONFIG_PATH is None:
+        raise gr.Error("The original PyTorch TTS model is not configured.")
+
+    with ORIGINAL_MODEL_LOCK:
+        if ORIGINAL_MODEL is None:
+            print(
+                "[Confucius4-TTS] Loading original PyTorch T2S backend "
+                f"on {SERVE_DEVICE}..."
+            )
+            ORIGINAL_MODEL = _load_original_model(
+                config_path=SERVE_CONFIG_PATH,
+                t2s_checkpoint=SERVE_T2S_CHECKPOINT,
+                device=SERVE_DEVICE,
+            )
+            print("[Confucius4-TTS] Original PyTorch TTS model is ready.")
+    return ORIGINAL_MODEL
+
+
+def _model(use_vllm: bool) -> Any:
+    return _vllm_model() if use_vllm else _original_model()
 
 
 def _output_path(prompt_wav: str, backend: str) -> Path:
@@ -217,7 +270,7 @@ def _synthesize(
         raise gr.Error("Enter text to synthesize.")
 
     lang = _language_code(language)
-    model = _model()
+    model = _model(use_vllm)
     backend_slug = "vllm" if use_vllm else "pytorch"
 
     started = time.perf_counter()
@@ -382,7 +435,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    global SERVE_DEVICE, SERVE_MODEL
+    global SERVE_CONFIG_PATH, SERVE_DEVICE, SERVE_MODEL, SERVE_T2S_CHECKPOINT
 
     args = parse_args()
     config_path = _resolve_repo_path(args.config, "Config")
@@ -398,6 +451,8 @@ def main() -> None:
         raise gr.Error("--concurrency-limit must be at least 1.")
     t2s_checkpoint = _normalize_checkpoint(args.t2s_checkpoint)
     vllm_attention_backend = _normalize_optional_text(args.vllm_attention_backend)
+    SERVE_CONFIG_PATH = config_path
+    SERVE_T2S_CHECKPOINT = t2s_checkpoint
 
     print(
         "[Confucius4-TTS] Loading always-on vLLM T2S backend "
