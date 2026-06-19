@@ -66,12 +66,8 @@ def _patch_gpu_model_runner_positions() -> None:
 
         for index, req_id in enumerate(req_ids):
             request = self.requests[req_id]
-            num_prompt_tokens = getattr(self.input_batch, "num_prompt_tokens", None)
-            if num_prompt_tokens is not None:
-                prompt_len = int(num_prompt_tokens[index])
-            else:
-                prompt_token_ids = getattr(request, "prompt_token_ids", ())
-                prompt_len = len(prompt_token_ids)
+            prompt_token_ids = getattr(request, "prompt_token_ids", ())
+            prompt_len = len(prompt_token_ids)
             offsets[index] = -(prompt_len - 1)
 
         positions_np = self.positions.np[:total]
