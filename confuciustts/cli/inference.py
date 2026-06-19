@@ -262,6 +262,23 @@ class ConfuciusTTS:
         )
         semantic_codes = t2s_out["semantic_codes"]  # (B, T_semantic)
         lm_latent = t2s_out["latent"]  # (B, T_semantic, D_hidden)
+        if verbose:
+            codes_cpu = semantic_codes.detach().cpu().flatten()
+            unique, counts = torch.unique(codes_cpu, return_counts=True)
+            order = torch.argsort(counts, descending=True)[:10]
+            top_tokens = [
+                (int(unique[idx]), int(counts[idx]))
+                for idx in order
+            ]
+            print(
+                "[ConfuciusTTS] T2S output: "
+                f"tokens={semantic_codes.shape[1]}, "
+                f"latent={tuple(lm_latent.shape)}, "
+                f"first={codes_cpu[:16].tolist()}, "
+                f"last={codes_cpu[-16:].tolist()}, "
+                f"top={top_tokens}",
+                flush=True,
+            )
 
         # Predict target mel length (heuristic: 1.72x semantic length)
         T = semantic_codes.shape[1]
