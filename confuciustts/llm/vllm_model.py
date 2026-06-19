@@ -61,7 +61,11 @@ from vllm.sequence import IntermediateTensors
 
 
 PLACEHOLDER_TOKEN = "!"
-PLACEHOLDER_TOKEN_ID = 0
+PLACEHOLDER_TOKEN_ID = 8192
+
+
+def _placeholder_token_id_from_config(config: object) -> int:
+    return int(getattr(config, "start_semantic_token", PLACEHOLDER_TOKEN_ID))
 
 
 class ConfuciusTTSProcessingInfo(BaseProcessingInfo):
@@ -120,6 +124,9 @@ class ConfuciusTTSDataParser(MultiModalDataParser):
 class ConfuciusTTSMultiModalProcessor(
     BaseMultiModalProcessor[ConfuciusTTSProcessingInfo]
 ):
+    def _placeholder_token_id(self) -> int:
+        return _placeholder_token_id_from_config(self.info.get_hf_config())
+
     def _call_hf_processor(
         self,
         prompt: str,
@@ -131,7 +138,7 @@ class ConfuciusTTSMultiModalProcessor(
             {
                 "input_ids": torch.full(
                     (1, len(prompt)),
-                    PLACEHOLDER_TOKEN_ID,
+                    self._placeholder_token_id(),
                     dtype=torch.long,
                 )
             }
@@ -151,18 +158,19 @@ class ConfuciusTTSMultiModalProcessor(
         out_mm_kwargs: MultiModalKwargsItems,
     ) -> List[PromptUpdate]:
         out_mm_data = out_mm_kwargs.get_data()
+        placeholder_token_id = self._placeholder_token_id()
 
         def get_replacement(item_idx: int) -> PromptUpdateDetails:
             embeds = out_mm_data["audio_embeds"][item_idx]
             return PromptUpdateDetails.select_token_id(
-                [PLACEHOLDER_TOKEN_ID] * embeds.shape[0],
-                PLACEHOLDER_TOKEN_ID,
+                [placeholder_token_id] * embeds.shape[0],
+                placeholder_token_id,
             )
 
         return [
             PromptReplacement(
                 modality="audio",
-                target=[PLACEHOLDER_TOKEN_ID],
+                target=[placeholder_token_id],
                 replacement=get_replacement,
             )
         ]
@@ -339,10 +347,14 @@ class ConfuciusText2SemanticForCausalLM(nn.Module, SupportsPP, SupportsMultiModa
     ) -> torch.Tensor:
         inputs_embeds = self.semantic_embedding(input_ids)
         if multimodal_embeddings is not None and len(multimodal_embeddings) != 0:
+            if is_multimodal is None:
+                is_multimodal = input_ids == _placeholder_token_id_from_config(
+                    self.config
+                )
             inputs_embeds = _merge_multimodal_embeddings(
                 inputs_embeds=inputs_embeds,
                 multimodal_embeddings=multimodal_embeddings,
-                is_multimodal=input_ids == PLACEHOLDER_TOKEN_ID,
+                is_multimodal=is_multimodal,
             )
         return inputs_embeds
 
@@ -385,7 +397,11 @@ class ConfuciusText2SemanticForCausalLM(nn.Module, SupportsPP, SupportsMultiModa
         return self.final_norm(transformer_output)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
-        return self.logits_processor(self.semantic_head, hidden_states)
+        return self.logits_processor(
+            self.semantic_head,
+            hidden_states,
+            self.semantic_head.bias,
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
         params_dict = dict(self.named_parameters(remove_duplicate=False))

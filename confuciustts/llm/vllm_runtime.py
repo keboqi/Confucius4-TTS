@@ -79,6 +79,9 @@ class Text2SemanticVLLM:
         self.model_dir = str(Path(model_dir))
         self.SamplingParams = SamplingParams
         self._loop: Optional[_BackgroundLoop] = None
+        self.placeholder_token_id = int(
+            getattr(torch_model.config, "start_semantic_token", PLACEHOLDER_TOKEN_ID)
+        )
 
         args: Dict[str, Any] = {
             "model": self.model_dir,
@@ -226,7 +229,7 @@ class Text2SemanticVLLM:
         }
         try:
             prompt = self.TokensPrompt(
-                prompt_token_ids=[PLACEHOLDER_TOKEN_ID],
+                prompt_token_ids=[self.placeholder_token_id],
                 **prompt_kwargs,
             )
         except TypeError:
