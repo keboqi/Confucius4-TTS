@@ -35,10 +35,14 @@ class Text2SemanticConfig(PretrainedConfig):
     model_type = "text2semantic"
 
     num_layers: int = 24
+    num_hidden_layers: int = 24
     model_dim: int = 1280
+    hidden_size: int = 1280
     num_heads: int = 20
+    num_attention_heads: int = 20
     max_text_seq_lens: int = 520
     max_semantic_seq_lens: int = 1520
+    max_position_embeddings: int = 2041
     vocab_size: int = 32000
     semantic_vocab_size: int = 8194
     text_embedding_dim: int = 4096
@@ -63,10 +67,14 @@ class Text2SemanticConfig(PretrainedConfig):
     ):
         super().__init__(**kwargs)
         self.num_layers = num_layers
+        self.num_hidden_layers = num_layers
         self.model_dim = model_dim
+        self.hidden_size = model_dim
         self.num_heads = num_heads
+        self.num_attention_heads = num_heads
         self.max_text_seq_lens = max_text_seq_lens
         self.max_semantic_seq_lens = max_semantic_seq_lens
+        self.max_position_embeddings = max_text_seq_lens + max_semantic_seq_lens + 1
         self.vocab_size = vocab_size
         self.semantic_vocab_size = semantic_vocab_size
         self.text_embedding_dim = text_embedding_dim
