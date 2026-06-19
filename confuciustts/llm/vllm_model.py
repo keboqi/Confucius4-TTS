@@ -5,6 +5,7 @@ It registers a GPT-2-like causal LM whose prompt is supplied as precomputed
 embeddings and whose decoded tokens are Confucius semantic codes.
 """
 
+from collections import defaultdict
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple, Union
 
 import torch
@@ -49,6 +50,12 @@ from vllm.multimodal.processing import (
     PromptReplacement,
     PromptUpdate,
     PromptUpdateDetails,
+)
+from vllm.multimodal.processing.processor import (
+    MultiModalPromptUpdates,
+    PlaceholderFeaturesInfo,
+    apply_token_matches,
+    find_mm_placeholders,
 )
 from vllm.sequence import IntermediateTensors
 
@@ -159,6 +166,51 @@ class ConfuciusTTSMultiModalProcessor(
                 replacement=get_replacement,
             )
         ]
+
+    def _find_mm_placeholders(
+        self,
+        new_token_ids: List[int],
+        mm_prompt_updates: MultiModalPromptUpdates,
+    ) -> Mapping[str, List[PlaceholderFeaturesInfo]]:
+        return find_mm_placeholders(new_token_ids, mm_prompt_updates, None)
+
+    def _apply_token_matches(
+        self,
+        prompt: List[int],
+        mm_prompt_updates: MultiModalPromptUpdates,
+    ):
+        return apply_token_matches(prompt, mm_prompt_updates, None)
+
+    def _apply_prompt_updates(
+        self,
+        token_ids: List[int],
+        mm_prompt_updates: MultiModalPromptUpdates,
+    ) -> Tuple[List[int], Mapping[str, List[PlaceholderFeaturesInfo]]]:
+        new_token_ids, match_result = self._apply_token_matches(
+            token_ids,
+            mm_prompt_updates,
+        )
+        if not all(
+            all(update_idx is not None for update_idx in update_idxs)
+            for update_idxs in match_result.values()
+        ):
+            raise RuntimeError(
+                "Failed to apply Confucius vLLM placeholder updates using "
+                "token IDs only. The adapter requires token-list prompts when "
+                "skip_tokenizer_init=True."
+            )
+
+        matched_updates: Dict[str, List[List[object]]] = defaultdict(list)
+        for modality, update_idxs in match_result.items():
+            for item_idx, update_idx in enumerate(update_idxs):
+                matched_updates[modality].append(
+                    [mm_prompt_updates[modality][item_idx][update_idx]]
+                )
+
+        return new_token_ids, self._find_mm_placeholders(
+            new_token_ids,
+            dict(matched_updates),
+        )
 
 
 @support_torch_compile
