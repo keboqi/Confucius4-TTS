@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+import sys
 import threading
 import uuid
 import warnings
@@ -59,6 +60,7 @@ class Text2SemanticVLLM:
         engine_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+        _prepend_repo_to_pythonpath_for_workers()
         _ensure_confucius_vllm_plugin_entrypoint()
         register_confucius_vllm_model()
 
@@ -357,6 +359,18 @@ def _ensure_confucius_vllm_plugin_entrypoint() -> None:
             os.environ["VLLM_PLUGINS"] = (
                 f"{enabled_plugins},{_CONFUCIUS_VLLM_PLUGIN_NAME}"
             )
+
+
+def _prepend_repo_to_pythonpath_for_workers() -> None:
+    repo_root = str(Path(__file__).resolve().parents[2])
+    if not sys.path or sys.path[0] != repo_root:
+        sys.path.insert(0, repo_root)
+
+    pythonpath = os.environ.get("PYTHONPATH")
+    paths = pythonpath.split(os.pathsep) if pythonpath else []
+    if not paths or paths[0] != repo_root:
+        paths = [path for path in paths if path != repo_root]
+        os.environ["PYTHONPATH"] = os.pathsep.join([repo_root, *paths])
 
 
 def _filter_kwargs(callable_obj: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
