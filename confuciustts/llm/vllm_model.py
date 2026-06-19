@@ -347,10 +347,13 @@ class ConfuciusText2SemanticForCausalLM(nn.Module, SupportsPP, SupportsMultiModa
     ) -> torch.Tensor:
         inputs_embeds = self.semantic_embedding(input_ids)
         if multimodal_embeddings is not None and len(multimodal_embeddings) != 0:
+            placeholder_mask = input_ids == _placeholder_token_id_from_config(
+                self.config
+            )
             if is_multimodal is None:
-                is_multimodal = input_ids == _placeholder_token_id_from_config(
-                    self.config
-                )
+                is_multimodal = placeholder_mask
+            else:
+                is_multimodal = is_multimodal | placeholder_mask
             inputs_embeds = _merge_multimodal_embeddings(
                 inputs_embeds=inputs_embeds,
                 multimodal_embeddings=multimodal_embeddings,
@@ -382,7 +385,7 @@ class ConfuciusText2SemanticForCausalLM(nn.Module, SupportsPP, SupportsMultiModa
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
 
-        inputs_embeds = inputs_embeds + self._semantic_position_embeds(
+        inputs_embeds += self._semantic_position_embeds(
             positions,
             inputs_embeds.dtype,
         )
