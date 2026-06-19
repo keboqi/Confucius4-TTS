@@ -149,18 +149,49 @@ def _load_serving_model(
 
 def _model() -> Any:
     if SERVE_MODEL is None:
-        raise gr.Error("The vLLM-backed TTS model is not loaded.")
+        raise gr.Error("The TTS model is not loaded.")
     return SERVE_MODEL
 
 
-def _output_path(prompt_wav: str) -> Path:
+def _output_path(prompt_wav: str, backend: str) -> Path:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha1(f"{prompt_wav}-{time.time_ns()}".encode("utf-8")).hexdigest()[:8]
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    return OUTPUT_DIR / f"confucius4tts-{stamp}-{digest}.wav"
+    return OUTPUT_DIR / f"confucius4tts-{backend}-{stamp}-{digest}.wav"
 
 
-def synthesize(
+def _format_timing_status(
+    output: Path,
+    audio: torch.Tensor,
+    sample_rate: int,
+    timing_info: dict[str, Any],
+    save_elapsed: float,
+    request_elapsed: float,
+) -> str:
+    generated_seconds = audio.shape[-1] / sample_rate
+    lines = [
+        (
+            f"{timing_info['backend']} generated {generated_seconds:.2f}s "
+            f"of audio in {request_elapsed:.2f}s on {SERVE_DEVICE}."
+        ),
+        (
+            f"segments={timing_info['segments']}, "
+            f"semantic_tokens={timing_info['semantic_tokens']}, "
+            f"saved={output}"
+        ),
+        "",
+        "Timings:",
+    ]
+    for name, seconds in timing_info["steps"].items():
+        lines.append(f"{name}: {seconds:.3f}s")
+    lines.append(f"model_total: {timing_info['total']:.3f}s")
+    lines.append(f"save_wav: {save_elapsed:.3f}s")
+    lines.append(f"request_total: {request_elapsed:.3f}s")
+    return "\n".join(lines)
+
+
+def _synthesize(
+    use_vllm: bool,
     prompt_wav: Optional[str],
     text: str,
     language: str,
@@ -187,9 +218,10 @@ def synthesize(
 
     lang = _language_code(language)
     model = _model()
+    backend_slug = "vllm" if use_vllm else "pytorch"
 
-    started = time.time()
-    audio = model.generate(
+    started = time.perf_counter()
+    audio, timing_info = model.generate(
         text=text,
         lang=lang,
         prompt_wav=prompt_wav,
@@ -204,18 +236,35 @@ def synthesize(
         max_text_tokens_per_segment=int(max_text_tokens),
         cross_fade_duration=float(cross_fade_duration),
         verbose=bool(verbose),
+        use_vllm=use_vllm,
+        return_timings=True,
     )
 
-    output = _output_path(prompt_wav)
-    torchaudio.save(str(output), audio.detach().float().cpu(), model.sample_rate)
+    output = _output_path(prompt_wav, backend_slug)
+    save_started = time.perf_counter()
+    if torch.cuda.is_available() and model.device.type == "cuda":
+        torch.cuda.synchronize(model.device)
+    audio_cpu = audio.detach().float().cpu()
+    torchaudio.save(str(output), audio_cpu, model.sample_rate)
+    save_elapsed = time.perf_counter() - save_started
 
-    generated_seconds = audio.shape[-1] / model.sample_rate
-    elapsed = time.time() - started
-    status = (
-        f"Generated {generated_seconds:.2f}s of audio in {elapsed:.2f}s "
-        f"on {SERVE_DEVICE} with vLLM T2S. Saved to {output}."
+    status = _format_timing_status(
+        output=output,
+        audio=audio,
+        sample_rate=model.sample_rate,
+        timing_info=timing_info,
+        save_elapsed=save_elapsed,
+        request_elapsed=time.perf_counter() - started,
     )
     return str(output), str(output), status
+
+
+def synthesize_vllm(*args: Any) -> tuple[str, str, str]:
+    return _synthesize(True, *args)
+
+
+def synthesize_original(*args: Any) -> tuple[str, str, str]:
+    return _synthesize(False, *args)
 
 
 def build_demo() -> gr.Blocks:
@@ -242,7 +291,8 @@ def build_demo() -> gr.Blocks:
                     max_lines=14,
                 )
                 with gr.Row():
-                    generate_btn = gr.Button("Generate", variant="primary")
+                    generate_vllm_btn = gr.Button("Generate with vLLM", variant="primary")
+                    generate_original_btn = gr.Button("Generate original")
 
         with gr.Accordion("Generation settings", open=False):
             with gr.Row():
@@ -262,29 +312,46 @@ def build_demo() -> gr.Blocks:
         with gr.Accordion("Server settings", open=False):
             verbose = gr.Checkbox(label="Verbose inference logs", value=False)
 
-        output_audio = gr.Audio(label="Generated audio", type="filepath")
-        output_file = gr.File(label="Download WAV")
-        status = gr.Textbox(label="Status", interactive=False)
+        with gr.Row():
+            with gr.Column():
+                vllm_audio = gr.Audio(label="vLLM audio", type="filepath")
+                vllm_file = gr.File(label="Download vLLM WAV")
+                vllm_status = gr.Textbox(label="vLLM timing", interactive=False, lines=14)
+            with gr.Column():
+                original_audio = gr.Audio(label="Original audio", type="filepath")
+                original_file = gr.File(label="Download original WAV")
+                original_status = gr.Textbox(label="Original timing", interactive=False, lines=14)
 
-        generate_btn.click(
-            fn=synthesize,
+        generation_inputs = [
+            prompt_wav,
+            text,
+            language,
+            temperature,
+            top_p,
+            top_k,
+            num_beams,
+            repetition_penalty,
+            max_length,
+            diffusion_steps,
+            cfg_strength,
+            max_text_tokens,
+            cross_fade_duration,
+            verbose,
+        ]
+
+        generate_vllm_btn.click(
+            fn=synthesize_vllm,
             inputs=[
-                prompt_wav,
-                text,
-                language,
-                temperature,
-                top_p,
-                top_k,
-                num_beams,
-                repetition_penalty,
-                max_length,
-                diffusion_steps,
-                cfg_strength,
-                max_text_tokens,
-                cross_fade_duration,
-                verbose,
+                *generation_inputs,
             ],
-            outputs=[output_audio, output_file, status],
+            outputs=[vllm_audio, vllm_file, vllm_status],
+        )
+        generate_original_btn.click(
+            fn=synthesize_original,
+            inputs=[
+                *generation_inputs,
+            ],
+            outputs=[original_audio, original_file, original_status],
         )
 
     return demo

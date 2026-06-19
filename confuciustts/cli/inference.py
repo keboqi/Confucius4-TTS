@@ -1,7 +1,10 @@
 import argparse
 import os
 import sys
-from typing import Optional
+import threading
+import time
+from collections import OrderedDict
+from typing import Any, Optional
 
 import safetensors.torch
 import torch
@@ -23,6 +26,31 @@ from confuciustts.llm.llm import Text2Semantic, Text2SemanticConfig
 from confuciustts.utils.audio_features import mel_spectrogram
 from confuciustts.utils.audio_post import cross_fade_concat
 from confuciustts.utils.text_utils import LANGUAGE_TOKEN_MAP
+
+
+class _StepTimer:
+    def __init__(
+        self,
+        owner: "ConfuciusTTS",
+        timings: Optional[OrderedDict[str, float]],
+        name: str,
+    ) -> None:
+        self.owner = owner
+        self.timings = timings
+        self.name = name
+        self.started = 0.0
+
+    def __enter__(self) -> "_StepTimer":
+        if self.timings is not None:
+            self.owner._sync_device()
+            self.started = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self.timings is not None:
+            self.owner._sync_device()
+            elapsed = time.perf_counter() - self.started
+            self.timings[self.name] = self.timings.get(self.name, 0.0) + elapsed
 
 
 class ConfuciusTTS:
@@ -53,6 +81,7 @@ class ConfuciusTTS:
     ):
         self.device = torch.device(device)
         self.t2s_vllm = None
+        self._pytorch_t2s_lock = threading.Lock()
 
         with open(config_path, "r", encoding="utf-8") as f:
             self.cfg = yaml.safe_load(f)
@@ -130,6 +159,19 @@ class ConfuciusTTS:
         self.bigvgan = BigVGAN.from_pretrained(paths["vocoder_path"], use_cuda_kernel=False)
         self.bigvgan.remove_weight_norm()
         self.bigvgan.eval().to(self.device)
+
+    def _sync_device(self) -> None:
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(self.device)
+
+    def _select_t2s_backend(self, use_vllm: Optional[bool]):
+        if use_vllm is False:
+            return self.t2s_model, "pytorch"
+        if self.t2s_vllm is not None:
+            return self.t2s_vllm, "vllm"
+        if use_vllm is True:
+            raise RuntimeError("vLLM T2S was requested, but the vLLM backend is not loaded.")
+        return self.t2s_model, "pytorch"
 
     def _load_prompt(self, prompt_wav: str):
         """Load and resample reference audio to 16kHz and target sample rate.
@@ -220,7 +262,9 @@ class ConfuciusTTS:
         n_timesteps: int,
         inference_cfg_rate: float,
         verbose: bool,
-    ) -> torch.Tensor:
+        use_vllm: Optional[bool] = None,
+        timings: Optional[OrderedDict[str, float]] = None,
+    ) -> tuple[torch.Tensor, int]:
         """Synthesize audio for a single text segment using T2S and S2A models.
 
         Args:
@@ -244,22 +288,40 @@ class ConfuciusTTS:
         """
         lang_token = LANGUAGE_TOKEN_MAP.get(lang, f"请用{lang}朗读接下来的文字")
         formatted = f"You are a helpful assistant. {lang_token}:{text}"
-        token_ids = self.tokenizer.encode(formatted, return_tensors="pt").to(self.device)
+        with _StepTimer(self, timings, "text_tokenize"):
+            token_ids = self.tokenizer.encode(formatted, return_tensors="pt").to(self.device)
 
-        t2s_backend = self.t2s_vllm if self.t2s_vllm is not None else self.t2s_model
-        t2s_out = t2s_backend.generate(
-            text_inputs=token_ids,
-            condition_vector=semantic_features,
-            max_length=max_length,
-            num_beams=num_beams,
-            do_sample=True,
-            top_p=top_p,
-            top_k=top_k,
-            temperature=temperature,
-            repetition_penalty=repetition_penalty,
-            early_stopping=True,
-            return_latent=True,
-        )
+        t2s_backend, backend_name = self._select_t2s_backend(use_vllm)
+        with _StepTimer(self, timings, f"t2s_{backend_name}"):
+            if backend_name == "pytorch":
+                with self._pytorch_t2s_lock:
+                    t2s_out = t2s_backend.generate(
+                        text_inputs=token_ids,
+                        condition_vector=semantic_features,
+                        max_length=max_length,
+                        num_beams=num_beams,
+                        do_sample=True,
+                        top_p=top_p,
+                        top_k=top_k,
+                        temperature=temperature,
+                        repetition_penalty=repetition_penalty,
+                        early_stopping=True,
+                        return_latent=True,
+                    )
+            else:
+                t2s_out = t2s_backend.generate(
+                    text_inputs=token_ids,
+                    condition_vector=semantic_features,
+                    max_length=max_length,
+                    num_beams=num_beams,
+                    do_sample=True,
+                    top_p=top_p,
+                    top_k=top_k,
+                    temperature=temperature,
+                    repetition_penalty=repetition_penalty,
+                    early_stopping=True,
+                    return_latent=True,
+                )
         semantic_codes = t2s_out["semantic_codes"]  # (B, T_semantic)
         lm_latent = t2s_out["latent"]  # (B, T_semantic, D_hidden)
         if verbose or os.getenv("CONFUCIUS_VLLM_DEBUG_GENERATION"):
@@ -285,17 +347,20 @@ class ConfuciusTTS:
         target_lengths = torch.tensor([int(T * 1.72)], device=self.device)
 
         # S2A: Generate mel-spectrogram from semantic tokens
-        mel = self.s2a_model.inference(
-            semantic_token=semantic_codes,
-            lm_latent=lm_latent,
-            prompt_feat=reference_mel,
-            embedding=style_embedding,
-            target_feat_len=target_lengths,
-            n_timesteps=n_timesteps,
-            inference_cfg_rate=inference_cfg_rate,
-        )
+        with _StepTimer(self, timings, "s2a"):
+            mel = self.s2a_model.inference(
+                semantic_token=semantic_codes,
+                lm_latent=lm_latent,
+                prompt_feat=reference_mel,
+                embedding=style_embedding,
+                target_feat_len=target_lengths,
+                n_timesteps=n_timesteps,
+                inference_cfg_rate=inference_cfg_rate,
+            )
         # Vocoder: Mel → Waveform
-        return self.bigvgan(mel.float().to(self.device)).squeeze(1)
+        with _StepTimer(self, timings, "vocoder"):
+            audio = self.bigvgan(mel.float().to(self.device)).squeeze(1)
+        return audio, T
 
     @torch.no_grad()
     def generate(
@@ -316,7 +381,9 @@ class ConfuciusTTS:
         edge_fade_duration: float = 0.1,
         edge_pad_duration: float = 0.1,
         verbose: bool = False,
-    ) -> torch.Tensor:
+        use_vllm: Optional[bool] = None,
+        return_timings: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, Any]]:
         """Generate speech audio from text with voice cloning.
 
         Performs text normalization, segmentation, then synthesizes each segment
@@ -343,24 +410,36 @@ class ConfuciusTTS:
         Returns:
             Generated audio waveform, shape (1, T_audio) at target sample rate
         """
+        timings: Optional[OrderedDict[str, float]] = OrderedDict() if return_timings else None
+        if timings is not None:
+            self._sync_device()
+        total_started = time.perf_counter()
+        _, backend_name = self._select_t2s_backend(use_vllm)
+
         # Normalize text (punctuation, numbers, etc.)
-        text = self.normalizer.normalize(text, language=lang)
+        with _StepTimer(self, timings, "normalize_text"):
+            text = self.normalizer.normalize(text, language=lang)
         if verbose:
             print(f"[ConfuciusTTS] normalized text: {text}")
 
         # Extract conditioning from reference audio
-        wav_16k, wav_tgt = self._load_prompt(prompt_wav)
-        semantic_features = self._extract_semantic(wav_16k)
-        style_embedding = self._extract_style(wav_16k)
-        reference_mel = self._ref_mel(wav_tgt)
+        with _StepTimer(self, timings, "load_prompt"):
+            wav_16k, wav_tgt = self._load_prompt(prompt_wav)
+        with _StepTimer(self, timings, "extract_semantic"):
+            semantic_features = self._extract_semantic(wav_16k)
+        with _StepTimer(self, timings, "extract_style"):
+            style_embedding = self._extract_style(wav_16k)
+        with _StepTimer(self, timings, "reference_mel"):
+            reference_mel = self._ref_mel(wav_tgt)
 
         # Split long text into segments
-        segments = self.normalizer.segment_text(
-            text,
-            tokenize_fn=self.tokenizer.tokenize,
-            language=lang,
-            max_tokens=max_text_tokens_per_segment,
-        )
+        with _StepTimer(self, timings, "segment_text"):
+            segments = self.normalizer.segment_text(
+                text,
+                tokenize_fn=self.tokenizer.tokenize,
+                language=lang,
+                max_tokens=max_text_tokens_per_segment,
+            )
         if not segments:
             segments = [text]
         if verbose:
@@ -368,22 +447,36 @@ class ConfuciusTTS:
 
         # Synthesize each segment independently
         chunks = []
+        semantic_token_total = 0
         for i, seg in enumerate(segments):
             if verbose:
                 print(f"[ConfuciusTTS] segment {i + 1}/{len(segments)}: {seg!r}")
-            audio = self._synth_segment(
+            audio, semantic_tokens = self._synth_segment(
                 seg, lang, semantic_features, style_embedding, reference_mel,
                 temperature, top_p, top_k, num_beams, repetition_penalty,
                 max_length, n_timesteps, inference_cfg_rate, verbose,
+                use_vllm=use_vllm,
+                timings=timings,
             )
+            semantic_token_total += semantic_tokens
             if audio.dim() == 1:
                 audio = audio.unsqueeze(0)
             chunks.append(audio)
 
         # Merge segments with cross-fade
-        merged = cross_fade_concat(chunks, self.sample_rate,
-                                   silence_duration=cross_fade_duration)
+        with _StepTimer(self, timings, "merge_segments"):
+            merged = cross_fade_concat(chunks, self.sample_rate,
+                                       silence_duration=cross_fade_duration)
 
+        if return_timings:
+            self._sync_device()
+            return merged, {
+                "backend": "vLLM T2S" if backend_name == "vllm" else "Original PyTorch T2S",
+                "segments": len(segments),
+                "semantic_tokens": semantic_token_total,
+                "steps": timings,
+                "total": time.perf_counter() - total_started,
+            }
         return merged
 
 
