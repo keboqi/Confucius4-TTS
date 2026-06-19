@@ -37,6 +37,8 @@ def parse_args():
                    help="vLLM tensor parallel size")
     p.add_argument("--vllm-dtype", type=str, default="auto",
                    help="vLLM dtype argument")
+    p.add_argument("--vllm-attention-backend", type=str, default=None,
+                   help="Optional vLLM attention backend override, e.g. FLASHINFER or FLASH_ATTN")
     p.add_argument("--temperature", type=float, default=0.8,
                    help="Sampling temperature for T2S generation (higher = more diverse)")
     p.add_argument("--top-p", type=float, default=0.8,
@@ -67,6 +69,7 @@ def main():
         vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
         vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
         vllm_dtype=args.vllm_dtype,
+        vllm_attention_backend=args.vllm_attention_backend,
     )
     t0 = time.time()
     audio = model.generate(

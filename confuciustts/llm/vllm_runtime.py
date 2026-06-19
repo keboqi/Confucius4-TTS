@@ -48,6 +48,7 @@ class Text2SemanticVLLM:
         gpu_memory_utilization: float = 0.25,
         tensor_parallel_size: int = 1,
         dtype: str = "auto",
+        attention_backend: Optional[str] = None,
         max_num_seqs: Optional[int] = None,
         max_model_len: Optional[int] = None,
         engine_kwargs: Optional[Dict[str, Any]] = None,
@@ -81,6 +82,8 @@ class Text2SemanticVLLM:
             "async_scheduling": True,
             "skip_tokenizer_init": True,
         }
+        if attention_backend:
+            args["attention_backend"] = attention_backend
         if max_num_seqs is not None:
             args["max_num_seqs"] = max_num_seqs
         if max_model_len is not None:

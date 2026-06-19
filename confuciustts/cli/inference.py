@@ -49,6 +49,7 @@ class ConfuciusTTS:
         vllm_gpu_memory_utilization: float = 0.25,
         vllm_tensor_parallel_size: int = 1,
         vllm_dtype: str = "auto",
+        vllm_attention_backend: Optional[str] = None,
     ):
         self.device = torch.device(device)
         self.t2s_vllm = None
@@ -95,6 +96,7 @@ class ConfuciusTTS:
                 gpu_memory_utilization=vllm_gpu_memory_utilization,
                 tensor_parallel_size=vllm_tensor_parallel_size,
                 dtype=vllm_dtype,
+                attention_backend=vllm_attention_backend,
             )
         self.t2s_model.to(self.device)
 
@@ -386,6 +388,8 @@ def main():
     parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.25)
     parser.add_argument("--vllm_tensor_parallel_size", type=int, default=1)
     parser.add_argument("--vllm_dtype", type=str, default="auto")
+    parser.add_argument("--vllm_attention_backend", type=str, default=None,
+                        help="Optional vLLM attention backend override, e.g. FLASHINFER or FLASH_ATTN.")
     parser.add_argument("--cross_fade_duration", type=float, default=0.3)
     parser.add_argument("--edge_fade_duration", type=float, default=0.1)
     parser.add_argument("--edge_pad_duration", type=float, default=0.1)
@@ -401,6 +405,7 @@ def main():
         vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
         vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
         vllm_dtype=args.vllm_dtype,
+        vllm_attention_backend=args.vllm_attention_backend,
     )
     audio = model.generate(
         args.text, args.lang, args.prompt_wav,

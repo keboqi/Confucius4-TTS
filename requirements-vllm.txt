@@ -3,5 +3,10 @@
 # Install after requirements.txt and requirements-cu128.txt.
 vllm==0.16.0
 
+# vLLM's CUDA path prefers FlashInfer on Blackwell before FlashAttention.
+# Pin the FlashInfer version from vLLM 0.16.0's CUDA dependency set instead
+# of source-building flash-attn in deploy environments.
+flashinfer-python==0.6.3
+
 # Keep protobuf aligned with vLLM/gRPC while avoiding protobuf 6 churn.
 protobuf>=5.29.6,<6.0.0

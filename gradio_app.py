@@ -106,9 +106,13 @@ def _ensure_cuda_usable() -> None:
         ) from exc
 
 
-def _normalize_checkpoint(value: str) -> Optional[str]:
+def _normalize_optional_text(value: str) -> Optional[str]:
     value = value.strip()
     return value or None
+
+
+def _normalize_checkpoint(value: str) -> Optional[str]:
+    return _normalize_optional_text(value)
 
 
 def _load_serving_model(
@@ -119,6 +123,7 @@ def _load_serving_model(
     vllm_gpu_memory_utilization: float,
     vllm_tensor_parallel_size: int,
     vllm_dtype: str,
+    vllm_attention_backend: Optional[str],
 ) -> Any:
     try:
         from confuciustts.cli.inference import ConfuciusTTS
@@ -138,6 +143,7 @@ def _load_serving_model(
         vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
         vllm_tensor_parallel_size=vllm_tensor_parallel_size,
         vllm_dtype=vllm_dtype,
+        vllm_attention_backend=vllm_attention_backend,
     )
 
 
@@ -301,6 +307,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vllm-tensor-parallel-size", type=int,
                         default=int(os.getenv("CONFUCIUS_VLLM_TENSOR_PARALLEL_SIZE", "1")))
     parser.add_argument("--vllm-dtype", default=os.getenv("CONFUCIUS_VLLM_DTYPE", "auto"))
+    parser.add_argument("--vllm-attention-backend",
+                        default=os.getenv("CONFUCIUS_VLLM_ATTENTION_BACKEND", ""))
     parser.add_argument("--concurrency-limit", type=int,
                         default=int(os.getenv("GRADIO_CONCURRENCY_LIMIT", "100")))
     return parser.parse_args()
@@ -322,6 +330,7 @@ def main() -> None:
     if args.concurrency_limit < 1:
         raise gr.Error("--concurrency-limit must be at least 1.")
     t2s_checkpoint = _normalize_checkpoint(args.t2s_checkpoint)
+    vllm_attention_backend = _normalize_optional_text(args.vllm_attention_backend)
 
     print(
         "[Confucius4-TTS] Loading always-on vLLM T2S backend "
@@ -335,6 +344,7 @@ def main() -> None:
         vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
         vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
         vllm_dtype=args.vllm_dtype,
+        vllm_attention_backend=vllm_attention_backend,
     )
     print("[Confucius4-TTS] vLLM-backed TTS model is ready.")
 

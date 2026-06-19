@@ -1,7 +1,8 @@
 # RTX PRO 6000 Blackwell deployment wheel set.
-# Install after requirements.txt so Torch is replaced by CUDA 12.8 wheels:
+# Install after requirements.txt so Torch is replaced by CUDA 12.8 wheels.
+# Keep this aligned with vLLM 0.16.0's CUDA dependency set.
 #   pip install --force-reinstall -r requirements-cu128.txt
 --index-url https://download.pytorch.org/whl/cu128
-torch==2.7.0
-torchvision==0.22.0
-torchaudio==2.7.0
+torch==2.9.1
+torchvision==0.24.1
+torchaudio==2.9.1

@@ -139,6 +139,27 @@ python gradio_app.py \
     --concurrency-limit 100
 ```
 
+By default vLLM selects the first compatible attention backend. On Blackwell
+this normally means FlashInfer first, then FlashAttention, then Triton. The
+vLLM requirements pin `flashinfer-python`; avoid installing `flash-attn` by
+hand in the deployment environment unless the system CUDA toolkit matches the
+CUDA version used by PyTorch. For example, PyTorch `+cu128` with a CUDA 13.0
+`nvcc` will make `flash-attn` fall back to a source build and fail with a CUDA
+version mismatch.
+
+To force an attention backend for testing, add one of:
+
+```bash
+--vllm-attention-backend FLASHINFER
+--vllm-attention-backend FLASH_ATTN
+```
+
+You can verify the FlashInfer install with:
+
+```bash
+flashinfer show-config
+```
+
 The UI accepts a reference audio file, synthesis text, language selection,
 and advanced generation settings. Generated WAV files are saved under
 `outputs/gradio/`.
