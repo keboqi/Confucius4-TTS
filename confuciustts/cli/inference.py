@@ -100,21 +100,10 @@ class ConfuciusTTS:
 
         self.normalizer = TextNormalizer()
 
-        # Start vLLM before any CUDA context is created so forked engine
-        # processes inherit the custom Confucius model registration.
-        self.tokenizer = AutoTokenizer.from_pretrained(paths["tokenizer_path"])
-        t2s_config = Text2SemanticConfig(**self.cfg["t2s_model"])
-        self.t2s_model = Text2Semantic(t2s_config)
-        self.t2s_model.config.vocab_size = t2s_config.semantic_vocab_size
-
-        t2s_model_path = hf_hub_download(
-            "netease-youdao/Confucius4-TTS", filename=paths["t2s_checkpoint"]
-        )
-        self.t2s_model.load_state_dict(
-            safetensors.torch.load_file(t2s_model_path, device="cpu")
-        )
-        self.t2s_model.eval()
         if use_vllm:
+            # Start vLLM before any CUDA context is created so forked engine
+            # processes inherit the custom Confucius model registration.
+            self._load_t2s_model(paths, move_to_device=False)
             if vllm_model_dir is None:
                 vllm_model_dir = paths.get("t2s_vllm_dir", "./checkpoints/t2s-vllm")
             from confuciustts.llm.vllm_runtime import Text2SemanticVLLM
@@ -127,7 +116,7 @@ class ConfuciusTTS:
                 dtype=vllm_dtype,
                 attention_backend=vllm_attention_backend,
             )
-        self.t2s_model.to(self.device)
+            self.t2s_model.to(self.device)
 
         self.feature_extractor = SeamlessM4TFeatureExtractor.from_pretrained(paths["w2v_bert_path"])
         self.w2v_model = Wav2Vec2BertModel.from_pretrained(paths["w2v_bert_path"]).eval().to(self.device)
@@ -146,6 +135,9 @@ class ConfuciusTTS:
         self.style_encoder.load_state_dict(spk_state, strict=False)
         self.style_encoder.eval().to(self.device)
 
+        if not use_vllm:
+            self._load_t2s_model(paths, move_to_device=True)
+
         s2a_config = MaskedDiffWithXvecConfig(**self.cfg["s2a_model"])
         self.s2a_model = MaskedDiffWithXvec(s2a_config)
         s2a_model_path = hf_hub_download(
@@ -159,6 +151,22 @@ class ConfuciusTTS:
         self.bigvgan = BigVGAN.from_pretrained(paths["vocoder_path"], use_cuda_kernel=False)
         self.bigvgan.remove_weight_norm()
         self.bigvgan.eval().to(self.device)
+
+    def _load_t2s_model(self, paths: dict[str, Any], move_to_device: bool) -> None:
+        self.tokenizer = AutoTokenizer.from_pretrained(paths["tokenizer_path"])
+        t2s_config = Text2SemanticConfig(**self.cfg["t2s_model"])
+        self.t2s_model = Text2Semantic(t2s_config)
+        self.t2s_model.config.vocab_size = t2s_config.semantic_vocab_size
+
+        t2s_model_path = hf_hub_download(
+            "netease-youdao/Confucius4-TTS", filename=paths["t2s_checkpoint"]
+        )
+        self.t2s_model.load_state_dict(
+            safetensors.torch.load_file(t2s_model_path, device="cpu")
+        )
+        self.t2s_model.eval()
+        if move_to_device:
+            self.t2s_model.to(self.device)
 
     def _sync_device(self) -> None:
         if self.device.type == "cuda" and torch.cuda.is_available():
