@@ -306,7 +306,7 @@ def parse_args() -> argparse.Namespace:
                         default=float(os.getenv("CONFUCIUS_VLLM_GPU_MEMORY_UTILIZATION", "0.25")))
     parser.add_argument("--vllm-tensor-parallel-size", type=int,
                         default=int(os.getenv("CONFUCIUS_VLLM_TENSOR_PARALLEL_SIZE", "1")))
-    parser.add_argument("--vllm-dtype", default=os.getenv("CONFUCIUS_VLLM_DTYPE", "auto"))
+    parser.add_argument("--vllm-dtype", default=os.getenv("CONFUCIUS_VLLM_DTYPE", "float32"))
     parser.add_argument("--vllm-attention-backend",
                         default=os.getenv("CONFUCIUS_VLLM_ATTENTION_BACKEND", ""))
     parser.add_argument("--concurrency-limit", type=int,

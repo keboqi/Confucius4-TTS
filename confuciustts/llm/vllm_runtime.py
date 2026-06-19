@@ -53,7 +53,7 @@ class Text2SemanticVLLM:
         model_dir: str,
         gpu_memory_utilization: float = 0.25,
         tensor_parallel_size: int = 1,
-        dtype: str = "auto",
+        dtype: str = "float32",
         attention_backend: Optional[str] = None,
         max_num_seqs: Optional[int] = None,
         max_model_len: Optional[int] = None,

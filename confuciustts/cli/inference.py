@@ -48,7 +48,7 @@ class ConfuciusTTS:
         vllm_model_dir: Optional[str] = None,
         vllm_gpu_memory_utilization: float = 0.25,
         vllm_tensor_parallel_size: int = 1,
-        vllm_dtype: str = "auto",
+        vllm_dtype: str = "float32",
         vllm_attention_backend: Optional[str] = None,
     ):
         self.device = torch.device(device)
@@ -262,7 +262,7 @@ class ConfuciusTTS:
         )
         semantic_codes = t2s_out["semantic_codes"]  # (B, T_semantic)
         lm_latent = t2s_out["latent"]  # (B, T_semantic, D_hidden)
-        if verbose:
+        if verbose or os.getenv("CONFUCIUS_VLLM_DEBUG_GENERATION"):
             codes_cpu = semantic_codes.detach().cpu().flatten()
             unique, counts = torch.unique(codes_cpu, return_counts=True)
             order = torch.argsort(counts, descending=True)[:10]
@@ -404,7 +404,7 @@ def main():
                         help="Converted T2S vLLM directory from tools/convert_t2s_vllm.py.")
     parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.25)
     parser.add_argument("--vllm_tensor_parallel_size", type=int, default=1)
-    parser.add_argument("--vllm_dtype", type=str, default="auto")
+    parser.add_argument("--vllm_dtype", type=str, default="float32")
     parser.add_argument("--vllm_attention_backend", type=str, default=None,
                         help="Optional vLLM attention backend override, e.g. FLASHINFER or FLASH_ATTN.")
     parser.add_argument("--cross_fade_duration", type=float, default=0.3)

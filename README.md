@@ -135,6 +135,7 @@ python gradio_app.py \
     --device cuda \
     --config config/inference_config.yaml \
     --vllm-model-dir checkpoints/t2s-vllm \
+    --vllm-dtype float32 \
     --vllm-gpu-memory-utilization 0.25 \
     --concurrency-limit 100
 ```
@@ -170,6 +171,10 @@ flashinfer show-config
 The UI accepts a reference audio file, synthesis text, language selection,
 and advanced generation settings. Generated WAV files are saved under
 `outputs/gradio/`.
+
+The T2S checkpoint is trained and validated in FP32. The service defaults to
+`--vllm-dtype float32`; avoid vLLM `auto` downcasting unless you have validated
+audio quality for your deployment.
 
 ### vLLM T2S Backend
 

@@ -35,7 +35,7 @@ def parse_args():
                    help="vLLM GPU memory utilization")
     p.add_argument("--vllm-tensor-parallel-size", type=int, default=1,
                    help="vLLM tensor parallel size")
-    p.add_argument("--vllm-dtype", type=str, default="auto",
+    p.add_argument("--vllm-dtype", type=str, default="float32",
                    help="vLLM dtype argument")
     p.add_argument("--vllm-attention-backend", type=str, default=None,
                    help="Optional vLLM attention backend override, e.g. FLASHINFER or FLASH_ATTN")
