@@ -121,7 +121,13 @@ class ConfuciusTTSMultiModalProcessor(
         tok_kwargs: Mapping[str, object],
     ) -> BatchFeature:
         return BatchFeature(
-            {"input_ids": [[PLACEHOLDER_TOKEN_ID] * len(prompt)]}
+            {
+                "input_ids": torch.full(
+                    (1, len(prompt)),
+                    PLACEHOLDER_TOKEN_ID,
+                    dtype=torch.long,
+                )
+            }
         )
 
     def _get_mm_fields_config(
