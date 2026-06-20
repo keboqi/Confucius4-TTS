@@ -116,6 +116,62 @@ class Text2SemanticVLLM:
     def device(self) -> torch.device:
         return next(self.torch_model.parameters()).device
 
+    def _acoustic_semantic_vocab_size(self) -> int:
+        return int(
+            getattr(
+                self.torch_model.config,
+                "start_semantic_token",
+                getattr(self.torch_model.config, "semantic_vocab_size", 8194) - 2,
+            )
+        )
+
+    def _sanitize_generated_token_ids(
+        self,
+        token_ids: Sequence[int],
+        eos_token_id: int,
+    ) -> list[int]:
+        acoustic_vocab_size = self._acoustic_semantic_vocab_size()
+        bos_token_id = int(self.torch_model.config.start_semantic_token)
+        cleaned: list[int] = []
+        dropped: list[int] = []
+
+        for token in token_ids:
+            token = int(token)
+            if token == eos_token_id:
+                break
+            if 0 <= token < acoustic_vocab_size:
+                cleaned.append(token)
+            elif token == bos_token_id:
+                dropped.append(token)
+            else:
+                dropped.append(token)
+
+        if dropped:
+            warnings.warn(
+                "vLLM generated non-acoustic semantic token IDs and they were "
+                f"removed before S2A: {sorted(set(dropped))[:8]}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        if not cleaned:
+            raise RuntimeError(
+                "vLLM generated no valid acoustic semantic tokens. "
+                f"Raw token IDs started with: {list(token_ids)[:16]}"
+            )
+        return cleaned
+
+    def _validate_text_token_ids(self, text_inputs: torch.Tensor) -> None:
+        vocab_size = int(self.torch_model.text_projector.embed.num_embeddings)
+        invalid = (text_inputs < 0) | (text_inputs >= vocab_size)
+        if not invalid.any():
+            return
+        bad_ids = text_inputs[invalid].detach().cpu().unique().tolist()
+        raise ValueError(
+            "Text token IDs exceed the T2S text embedding vocabulary before "
+            f"vLLM prefix construction: vocab_size={vocab_size}, "
+            f"invalid_ids={bad_ids[:16]}"
+        )
+
     @torch.no_grad()
     def _build_prefix_embeddings(
         self,
@@ -124,6 +180,7 @@ class Text2SemanticVLLM:
     ) -> torch.Tensor:
         if text_inputs.shape[0] != 1:
             raise ValueError("The vLLM T2S wrapper currently expects batch size 1.")
+        self._validate_text_token_ids(text_inputs)
 
         model = self.torch_model
         condition_emb = model.speaker_encoder(condition_vector).unsqueeze(1)
@@ -249,6 +306,7 @@ class Text2SemanticVLLM:
         token_ids = list(final_output.outputs[0].token_ids)
         if eos in token_ids:
             token_ids = token_ids[: token_ids.index(eos)]
+        token_ids = self._sanitize_generated_token_ids(token_ids, eos)
 
         semantic_codes = torch.tensor(
             token_ids,

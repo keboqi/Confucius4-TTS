@@ -4,6 +4,7 @@ import sys
 import threading
 import time
 import traceback
+import warnings
 from collections import OrderedDict
 from typing import Any, Optional
 
@@ -329,10 +330,64 @@ class ConfuciusTTS:
         fbank = fbank - fbank.mean(dim=0, keepdim=True)
         return self.style_encoder(fbank.unsqueeze(0).to(self.device))
 
+    def _text_vocab_size(self) -> int:
+        return int(self.t2s_model.text_projector.embed.num_embeddings)
+
+    def _validate_text_token_ids(
+        self,
+        token_ids: torch.Tensor,
+        text: str,
+        lang: str,
+    ) -> None:
+        vocab_size = self._text_vocab_size()
+        if token_ids.numel() == 0:
+            raise ValueError(f"Tokenizer returned no IDs for {lang!r} text: {text!r}")
+        invalid = (token_ids < 0) | (token_ids >= vocab_size)
+        if not invalid.any():
+            return
+        bad_ids = token_ids[invalid].detach().cpu().unique().tolist()
+        raise ValueError(
+            f"Tokenizer produced IDs outside the T2S text vocabulary for lang={lang!r}: "
+            f"vocab_size={vocab_size}, invalid_ids={bad_ids[:16]}, text={text!r}. "
+            "This would otherwise trigger a CUDA embedding index assert."
+        )
+
     def _tokenize_segment(self, text: str, lang: str) -> torch.Tensor:
         lang_token = get_language_token(lang)
         formatted = f"You are a helpful assistant. {lang_token}:{text}"
-        return self.tokenizer.encode(formatted, return_tensors="pt").to(self.device)
+        token_ids = self.tokenizer.encode(formatted, return_tensors="pt")
+        self._validate_text_token_ids(token_ids, text, lang)
+        return token_ids.to(self.device)
+
+    def _sanitize_t2s_semantic_output(
+        self,
+        semantic_codes: torch.Tensor,
+        lm_latent: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        codebook_size = int(self.s2a_model.input_embedding.embedding.num_embeddings)
+        invalid = (semantic_codes < 0) | (semantic_codes >= codebook_size)
+        if not invalid.any():
+            return semantic_codes, lm_latent
+        if semantic_codes.shape[0] != 1:
+            raise ValueError(
+                "Cannot sanitize batched T2S semantic output with variable invalid "
+                f"positions: shape={tuple(semantic_codes.shape)}"
+            )
+        valid_mask = ~invalid[0]
+        if not valid_mask.any():
+            bad_ids = semantic_codes.detach().cpu().unique().tolist()
+            raise ValueError(
+                "T2S generated no valid acoustic semantic tokens for S2A: "
+                f"codebook_size={codebook_size}, generated_ids={bad_ids[:16]}"
+            )
+        bad_ids = semantic_codes[invalid].detach().cpu().unique().tolist()
+        warnings.warn(
+            "T2S generated non-acoustic semantic token IDs and they were removed "
+            f"before S2A: codebook_size={codebook_size}, invalid_ids={bad_ids[:16]}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return semantic_codes[:, valid_mask], lm_latent[:, valid_mask]
 
     def _generate_t2s(
         self,
@@ -471,6 +526,10 @@ class ConfuciusTTS:
     ) -> tuple[torch.Tensor, int, int, int, Optional[int]]:
         semantic_codes = t2s_out["semantic_codes"]  # (B, T_semantic)
         lm_latent = t2s_out["latent"]  # (B, T_semantic, D_hidden)
+        semantic_codes, lm_latent = self._sanitize_t2s_semantic_output(
+            semantic_codes,
+            lm_latent,
+        )
         self._log_t2s_output(semantic_codes, lm_latent, verbose)
 
         semantic_tokens = int(semantic_codes.shape[1])
