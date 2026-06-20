@@ -23,6 +23,8 @@ SERVE_MODEL: Any = None
 SERVE_DEVICE = "cuda"
 SERVE_CONFIG_PATH: Optional[str] = None
 SERVE_T2S_CHECKPOINT: Optional[str] = None
+SERVE_COMPILE_S2A: Optional[bool] = None
+SERVE_USE_BIGVGAN_CUDA_KERNEL: Optional[bool] = None
 
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
@@ -115,6 +117,26 @@ def _normalize_optional_text(value: str) -> Optional[str]:
     return value or None
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be one of: 1, true, yes, on, 0, false, no, off.")
+
+
+def _env_optional_bool(*names: str) -> Optional[bool]:
+    for name in names:
+        value = os.getenv(name)
+        if value is not None and value.strip():
+            return _env_bool(name)
+    return None
+
+
 def _normalize_checkpoint(value: str) -> Optional[str]:
     return _normalize_optional_text(value)
 
@@ -128,7 +150,8 @@ def _load_serving_model(
     vllm_tensor_parallel_size: int,
     vllm_dtype: str,
     vllm_attention_backend: Optional[str],
-    compile_s2a: bool,
+    compile_s2a: Optional[bool],
+    use_bigvgan_cuda_kernel: Optional[bool],
 ) -> Any:
     try:
         from confuciustts.cli.inference import ConfuciusTTS
@@ -150,6 +173,7 @@ def _load_serving_model(
         vllm_dtype=vllm_dtype,
         vllm_attention_backend=vllm_attention_backend,
         compile_s2a=compile_s2a,
+        use_cuda_kernel=use_bigvgan_cuda_kernel,
     )
 
 
@@ -309,6 +333,14 @@ def _synthesize_original_subprocess(
         command.extend(["--target-segment-durations", target_segment_durations])
     if SERVE_T2S_CHECKPOINT is not None:
         command.extend(["--t2s-checkpoint", SERVE_T2S_CHECKPOINT])
+    if SERVE_COMPILE_S2A is True:
+        command.append("--compile-s2a")
+    elif SERVE_COMPILE_S2A is False:
+        command.append("--no-compile-s2a")
+    if SERVE_USE_BIGVGAN_CUDA_KERNEL is True:
+        command.append("--use-bigvgan-cuda-kernel")
+    elif SERVE_USE_BIGVGAN_CUDA_KERNEL is False:
+        command.append("--no-use-bigvgan-cuda-kernel")
     if verbose:
         command.append("--verbose")
 
@@ -574,15 +606,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vllm-dtype", default=os.getenv("CONFUCIUS_VLLM_DTYPE", "float32"))
     parser.add_argument("--vllm-attention-backend",
                         default=os.getenv("CONFUCIUS_VLLM_ATTENTION_BACKEND", ""))
-    parser.add_argument("--compile-s2a", action="store_true",
-                        default=os.getenv("CONFUCIUS_COMPILE_S2A", "").lower() in {"1", "true", "yes", "on"})
+    parser.add_argument("--compile-s2a", "--use-torch-compile", "--use_torch_compile",
+                        action=argparse.BooleanOptionalAction, dest="compile_s2a",
+                        default=_env_optional_bool(
+                            "CONFUCIUS_USE_TORCH_COMPILE",
+                            "CONFUCIUS_COMPILE_S2A",
+                        ),
+                        help="Compile the S2A diffusion estimator with torch.compile. Defaults to enabled on CUDA.")
+    parser.add_argument("--use-bigvgan-cuda-kernel", action=argparse.BooleanOptionalAction,
+                        default=_env_optional_bool(
+                            "CONFUCIUS_USE_BIGVGAN_CUDA_KERNEL",
+                            "CONFUCIUS_BIGVGAN_USE_CUDA_KERNEL",
+                        ),
+                        help="Use BigVGAN's fused CUDA activation kernel. Defaults to enabled on CUDA.")
     parser.add_argument("--concurrency-limit", type=int,
                         default=int(os.getenv("GRADIO_CONCURRENCY_LIMIT", "100")))
     return parser.parse_args()
 
 
 def main() -> None:
-    global SERVE_CONFIG_PATH, SERVE_DEVICE, SERVE_MODEL, SERVE_T2S_CHECKPOINT
+    global SERVE_COMPILE_S2A, SERVE_CONFIG_PATH, SERVE_DEVICE, SERVE_MODEL
+    global SERVE_T2S_CHECKPOINT, SERVE_USE_BIGVGAN_CUDA_KERNEL
 
     args = parse_args()
     config_path = _resolve_repo_path(args.config, "Config")
@@ -600,10 +644,20 @@ def main() -> None:
     vllm_attention_backend = _normalize_optional_text(args.vllm_attention_backend)
     SERVE_CONFIG_PATH = config_path
     SERVE_T2S_CHECKPOINT = t2s_checkpoint
+    SERVE_COMPILE_S2A = args.compile_s2a
+    SERVE_USE_BIGVGAN_CUDA_KERNEL = args.use_bigvgan_cuda_kernel
+    compile_s2a_label = "auto" if SERVE_COMPILE_S2A is None else str(SERVE_COMPILE_S2A)
+    bigvgan_kernel_label = (
+        "auto"
+        if SERVE_USE_BIGVGAN_CUDA_KERNEL is None
+        else str(SERVE_USE_BIGVGAN_CUDA_KERNEL)
+    )
 
     print(
         "[Confucius4-TTS] Loading always-on vLLM T2S backend "
-        f"from {vllm_model_dir} on {SERVE_DEVICE}..."
+        f"from {vllm_model_dir} on {SERVE_DEVICE} "
+        f"(compile_s2a={compile_s2a_label}, "
+        f"use_bigvgan_cuda_kernel={bigvgan_kernel_label})..."
     )
     SERVE_MODEL = _load_serving_model(
         config_path=config_path,
@@ -615,6 +669,7 @@ def main() -> None:
         vllm_dtype=args.vllm_dtype,
         vllm_attention_backend=vllm_attention_backend,
         compile_s2a=args.compile_s2a,
+        use_bigvgan_cuda_kernel=args.use_bigvgan_cuda_kernel,
     )
     print("[Confucius4-TTS] vLLM-backed TTS model is ready.")
 

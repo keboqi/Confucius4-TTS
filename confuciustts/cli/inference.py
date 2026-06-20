@@ -3,6 +3,7 @@ import os
 import sys
 import threading
 import time
+import traceback
 from collections import OrderedDict
 from typing import Any, Optional
 
@@ -66,7 +67,8 @@ class ConfuciusTTS:
         config_path: Path to YAML configuration file with model paths and audio parameters
         t2s_checkpoint: Optional path to T2S checkpoint (overrides config)
         device: Device for inference ("cuda" or "cpu")
-        compile_s2a: Compile the S2A diffusion estimator with torch.compile
+        compile_s2a: Compile the S2A diffusion estimator with torch.compile. None enables it on CUDA.
+        use_cuda_kernel: Use BigVGAN's fused CUDA activation kernel. None enables it on CUDA.
     """
     def __init__(
         self,
@@ -79,9 +81,12 @@ class ConfuciusTTS:
         vllm_tensor_parallel_size: int = 1,
         vllm_dtype: str = "float32",
         vllm_attention_backend: Optional[str] = None,
-        compile_s2a: bool = False,
+        compile_s2a: Optional[bool] = None,
+        use_cuda_kernel: Optional[bool] = None,
     ):
         self.device = torch.device(device)
+        self.compile_s2a = self._resolve_compile_s2a(compile_s2a)
+        self.use_cuda_kernel = self._resolve_bigvgan_cuda_kernel(use_cuda_kernel)
         self.t2s_vllm = None
         self._pytorch_t2s_lock = threading.Lock()
 
@@ -149,12 +154,17 @@ class ConfuciusTTS:
             torch.load(s2a_model_path, map_location="cpu", weights_only=False)
         )
         self.s2a_model.eval().to(self.device)
-        if compile_s2a:
+        for param in self.s2a_model.parameters():
+            param.requires_grad = False
+        if self.compile_s2a:
             self._compile_s2a_estimator()
 
-        self.bigvgan = BigVGAN.from_pretrained(paths["vocoder_path"], use_cuda_kernel=False)
+        self._preload_bigvgan_cuda_kernel()
+        self.bigvgan = self._load_bigvgan(paths["vocoder_path"])
         self.bigvgan.remove_weight_norm()
         self.bigvgan.eval().to(self.device)
+        for param in self.bigvgan.parameters():
+            param.requires_grad = False
 
     def _load_t2s_model(self, paths: dict[str, Any], move_to_device: bool) -> None:
         self.tokenizer = AutoTokenizer.from_pretrained(paths["tokenizer_path"])
@@ -176,14 +186,62 @@ class ConfuciusTTS:
         if self.device.type == "cuda" and torch.cuda.is_available():
             torch.cuda.synchronize(self.device)
 
-    def _compile_s2a_estimator(self) -> None:
-        if not hasattr(torch, "compile"):
-            raise RuntimeError("torch.compile is not available in this PyTorch build.")
+    def _resolve_bigvgan_cuda_kernel(self, requested: Optional[bool]) -> bool:
         if self.device.type != "cuda":
-            raise RuntimeError("S2A torch.compile is only enabled for CUDA inference.")
+            if requested:
+                print("[ConfuciusTTS] BigVGAN CUDA kernel requested but disabled on non-CUDA device.")
+            return False
+        return True if requested is None else bool(requested)
+
+    def _resolve_compile_s2a(self, requested: Optional[bool]) -> bool:
+        if requested is False:
+            return False
+        if not hasattr(torch, "compile"):
+            if requested:
+                raise RuntimeError("torch.compile is not available in this PyTorch build.")
+            print("[ConfuciusTTS] torch.compile is not available; S2A compile disabled.")
+            return False
+        if self.device.type != "cuda":
+            if requested:
+                raise RuntimeError("S2A torch.compile is only enabled for CUDA inference.")
+            return False
+        return True
+
+    def _preload_bigvgan_cuda_kernel(self) -> None:
+        if not self.use_cuda_kernel:
+            return
+        try:
+            from external.bigvgan.alias_free_activation.cuda import load
+
+            anti_alias_activation_cuda = load.load()
+            print("[ConfuciusTTS] Preloaded custom CUDA kernel for BigVGAN:", anti_alias_activation_cuda)
+        except Exception:
+            traceback.print_exc()
+            print("[ConfuciusTTS] Failed to load custom CUDA kernel for BigVGAN. Falling back to torch.")
+            self.use_cuda_kernel = False
+
+    def _load_bigvgan(self, vocoder_path: str) -> BigVGAN:
+        try:
+            return BigVGAN.from_pretrained(
+                vocoder_path,
+                use_cuda_kernel=self.use_cuda_kernel,
+            )
+        except Exception:
+            if not self.use_cuda_kernel:
+                raise
+            traceback.print_exc()
+            print("[ConfuciusTTS] Failed to initialize BigVGAN with CUDA kernel. Falling back to torch.")
+            self.use_cuda_kernel = False
+            return BigVGAN.from_pretrained(vocoder_path, use_cuda_kernel=False)
+
+    def _s2a_estimator_max_seq_len(self) -> Optional[int]:
+        estimator = self.s2a_model.decoder.estimator
+        estimator = getattr(estimator, "_orig_mod", estimator)
+        return getattr(estimator, "max_seq_len", None)
+
+    def _compile_s2a_estimator(self) -> None:
         print("[ConfuciusTTS] Compiling S2A diffusion estimator with torch.compile...")
-        self.s2a_model.decoder.estimator = torch.compile(
-            self.s2a_model.decoder.estimator,
+        self.s2a_model.enable_torch_compile(
             fullgraph=True,
             dynamic=True,
             mode="reduce-overhead",
@@ -431,7 +489,7 @@ class ConfuciusTTS:
         prompt_condition = self.s2a_model.prompt_cond.expand(1, prompt_length, -1)
         cat_condition = torch.cat([prompt_condition, cond_target], dim=1)
         total_length = prompt_length + target_length
-        max_seq_len = getattr(self.s2a_model.decoder.estimator, "max_seq_len", None)
+        max_seq_len = self._s2a_estimator_max_seq_len()
         if max_seq_len is not None and total_length > max_seq_len:
             raise ValueError(
                 f"Requested S2A duration needs {total_length} mel frames including "
@@ -937,8 +995,12 @@ def main():
                         help="Optional final output duration target in seconds, sample-fitted for millisecond precision. 0 disables duration control.")
     parser.add_argument("--target_segment_durations", type=str, default="",
                         help="Comma-separated per-segment duration targets in seconds, sample-fitted for millisecond precision.")
-    parser.add_argument("--compile_s2a", action="store_true",
-                        help="Compile the S2A diffusion estimator with torch.compile.")
+    parser.add_argument("--compile_s2a", "--compile-s2a", "--use_torch_compile", "--use-torch-compile",
+                        action=argparse.BooleanOptionalAction, default=None, dest="compile_s2a",
+                        help="Compile the S2A diffusion estimator with torch.compile. Defaults to enabled on CUDA.")
+    parser.add_argument("--use_bigvgan_cuda_kernel", "--use-bigvgan-cuda-kernel",
+                        action=argparse.BooleanOptionalAction, default=None,
+                        help="Use BigVGAN's fused CUDA activation kernel. Defaults to enabled on CUDA.")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -953,6 +1015,7 @@ def main():
         vllm_dtype=args.vllm_dtype,
         vllm_attention_backend=args.vllm_attention_backend,
         compile_s2a=args.compile_s2a,
+        use_cuda_kernel=args.use_bigvgan_cuda_kernel,
     )
     audio = model.generate(
         args.text, args.lang, args.prompt_wav,

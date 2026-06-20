@@ -146,9 +146,15 @@ python gradio_app.py \
     --concurrency-limit 100
 ```
 
-Add `--compile-s2a` to compile the S2A diffusion estimator with
-`torch.compile`. This can improve repeated-generation throughput after the
-first compile/warmup pass, but startup and the first request will take longer.
+S2A diffusion uses `torch.compile` by default on CUDA. This can improve
+repeated-generation throughput after the first compile/warmup pass, but startup
+and the first request will take longer. Use `--no-compile-s2a` to disable it.
+The launcher also accepts the IndexTTS-style alias `--use-torch-compile`.
+
+BigVGAN uses NVIDIA's fused CUDA activation kernel automatically on CUDA,
+matching the IndexTTS fast path. Use `--no-use-bigvgan-cuda-kernel` to disable
+it, or set `CONFUCIUS_USE_BIGVGAN_CUDA_KERNEL=0`. If the kernel cannot be built
+or loaded, Confucius falls back to the plain torch BigVGAN implementation.
 
 Duration targets are specified in seconds and the final waveform is fitted at
 sample precision, so millisecond-level dubbing targets are preserved. The
@@ -195,7 +201,9 @@ audio quality for your deployment.
 
 The vLLM path accelerates the autoregressive Text2Semantic stage. Reference
 audio encoding, S2A diffusion, and BigVGAN remain in PyTorch; S2A diffusion can
-also be wrapped with `torch.compile` via `--compile-s2a`.
+wrap its DiT estimator with `torch.compile`, while BigVGAN can use its fused
+CUDA activation kernel for faster vocoding. Both optimizations are enabled by
+default on CUDA.
 
 The converted T2S directory is required before starting the service:
 

@@ -86,6 +86,27 @@ class ConditionalCFM(nn.Module):
             wavenet_num_layers=wavenet_num_layers,
             wavenet_dropout=wavenet_dropout,
         )
+        self.torch_compile_enabled = False
+
+    def enable_torch_compile(
+        self,
+        *,
+        fullgraph: bool = True,
+        dynamic: bool = True,
+        mode: str = "reduce-overhead",
+    ) -> None:
+        """Compile the DiT estimator used by the S2A flow decoder."""
+        if self.torch_compile_enabled:
+            return
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch._inductor.config.reorder_for_compute_comm_overlap = True
+        self.estimator = torch.compile(
+            self.estimator,
+            fullgraph=fullgraph,
+            dynamic=dynamic,
+            mode=mode,
+        )
+        self.torch_compile_enabled = True
 
     def compute_loss(self, x1: torch.Tensor, mask: torch.Tensor, mu: torch.Tensor, spks: torch.Tensor, prompt_lens: torch.Tensor):
         b, _, t = x1.shape
@@ -140,8 +161,6 @@ class ConditionalCFM(nn.Module):
     def solve_euler(self, x, t_span, x_lens, prompt, mu, spks, cfg_rate):
         t, _, dt = t_span[0], t_span[1], t_span[1] - t_span[0]
 
-        sol = []
-
         prompt_len = prompt.size(-1)
         prompt_x = torch.zeros_like(x)
         prompt_x[..., :prompt_len] = prompt[..., :prompt_len]
@@ -183,11 +202,10 @@ class ConditionalCFM(nn.Module):
 
             x = x + dt * dphi_dt
             t = t + dt
-            sol.append(x)
             if step < len(t_span) - 1:
                 dt = t_span[step + 1] - t
             x[:, :, :prompt_len] = 0
 
-        return sol[-1].float()
+        return x.float()
 
 

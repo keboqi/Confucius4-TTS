@@ -135,7 +135,24 @@ class MaskedDiffWithXvec(nn.Module):
         self.encoder_proj = nn.Linear(self.lm_latent_dim + self.semantic_embed_dim, config.lr_in_channels)
         self.prompt_cond = nn.Parameter(torch.zeros(1, 1, config.lr_out_channels))
         nn.init.normal_(self.prompt_cond, mean=0.0, std=0.02)
+        self.torch_compile_enabled = False
 
+    def enable_torch_compile(
+        self,
+        *,
+        fullgraph: bool = True,
+        dynamic: bool = True,
+        mode: str = "reduce-overhead",
+    ) -> None:
+        """Compile S2A inference hot paths for repeated generation."""
+        if self.torch_compile_enabled:
+            return
+        self.decoder.enable_torch_compile(
+            fullgraph=fullgraph,
+            dynamic=dynamic,
+            mode=mode,
+        )
+        self.torch_compile_enabled = True
 
     def forward(self, batch: Dict[str, torch.Tensor], device: Optional[torch.device] = None) -> Dict[str, torch.Tensor]:
         """Training forward pass with prompt conditioning.

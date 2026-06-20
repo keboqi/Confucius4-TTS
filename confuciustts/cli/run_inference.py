@@ -52,8 +52,12 @@ def parse_args():
                    help="vLLM dtype argument")
     p.add_argument("--vllm-attention-backend", type=str, default=None,
                    help="Optional vLLM attention backend override, e.g. FLASHINFER or FLASH_ATTN")
-    p.add_argument("--compile-s2a", action="store_true",
-                   help="Compile the S2A diffusion estimator with torch.compile")
+    p.add_argument("--compile-s2a", "--use-torch-compile", "--use_torch_compile",
+                   action=argparse.BooleanOptionalAction, default=None, dest="compile_s2a",
+                   help="Compile the S2A diffusion estimator with torch.compile. Defaults to enabled on CUDA")
+    p.add_argument("--use-bigvgan-cuda-kernel", action=argparse.BooleanOptionalAction,
+                   default=None,
+                   help="Use BigVGAN's fused CUDA activation kernel. Defaults to enabled on CUDA")
     p.add_argument("--temperature", type=float, default=0.8,
                    help="Sampling temperature for T2S generation (higher = more diverse)")
     p.add_argument("--top-p", type=float, default=0.8,
@@ -98,6 +102,7 @@ def main():
         vllm_dtype=args.vllm_dtype,
         vllm_attention_backend=args.vllm_attention_backend,
         compile_s2a=args.compile_s2a,
+        use_cuda_kernel=args.use_bigvgan_cuda_kernel,
     )
     t0 = time.time()
     audio = model.generate(
