@@ -150,6 +150,11 @@ Add `--compile-s2a` to compile the S2A diffusion estimator with
 `torch.compile`. This can improve repeated-generation throughput after the
 first compile/warmup pass, but startup and the first request will take longer.
 
+Duration targets are specified in seconds and the final waveform is fitted at
+sample precision, so millisecond-level dubbing targets are preserved. The
+S2A/vocoder render batch size defaults to `1`, which is currently fastest in
+testing; larger values remain available for experiments.
+
 `requirements-vllm.txt` also installs this repository in editable mode. This
 registers the Confucius custom T2S model as a `vllm.general_plugins` entry
 point, which is required because the Gradio service uses spawned vLLM engine

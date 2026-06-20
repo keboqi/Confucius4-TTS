@@ -72,12 +72,12 @@ def parse_args():
                    help="Classifier-free guidance scale (higher = stronger conditioning)")
     p.add_argument("--max-text-tokens", type=int, default=80,
                    help="Maximum tokenizer tokens per text segment")
-    p.add_argument("--segment-render-batch-size", type=int, default=4,
+    p.add_argument("--segment-render-batch-size", type=int, default=1,
                    help="Number of vLLM text segments to batch for S2A/vocoder rendering")
     p.add_argument("--target-duration-seconds", type=float, default=0.0,
-                   help="Optional final output duration target in seconds. 0 disables duration control")
+                   help="Optional final output duration target in seconds, sample-fitted for millisecond precision. 0 disables duration control")
     p.add_argument("--target-segment-durations", type=str, default="",
-                   help="Comma-separated per-segment duration targets in seconds")
+                   help="Comma-separated per-segment duration targets in seconds, sample-fitted for millisecond precision")
     p.add_argument("--cross-fade-duration", type=float, default=0.3,
                    help="Cross-fade duration between generated segments")
     p.add_argument("--verbose", action="store_true",
@@ -124,7 +124,7 @@ def main():
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     torchaudio.save(str(out), audio.cpu(), model.sample_rate)
-    print(f"Saved {out} ({audio.shape[-1] / model.sample_rate:.2f}s, took {dt:.2f}s)")
+    print(f"Saved {out} ({audio.shape[-1] / model.sample_rate:.3f}s, took {dt:.2f}s)")
 
 
 if __name__ == "__main__":

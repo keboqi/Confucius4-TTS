@@ -308,9 +308,32 @@ class ConfuciusTTS:
         return t2s_backend.generate(**kwargs), backend_name
 
     def _duration_seconds_to_frames(self, duration_seconds: Optional[float]) -> Optional[int]:
+        target_samples = self._duration_seconds_to_samples(duration_seconds)
+        if target_samples is None:
+            return None
+        return max(1, int(round(target_samples / self.hop_length)))
+
+    def _duration_seconds_to_samples(self, duration_seconds: Optional[float]) -> Optional[int]:
         if duration_seconds is None or duration_seconds <= 0:
             return None
-        return max(1, int(round(duration_seconds * self.sample_rate / self.hop_length)))
+        return max(1, int(round(duration_seconds * self.sample_rate)))
+
+    def _fit_audio_to_duration(
+        self,
+        audio: torch.Tensor,
+        target_duration_seconds: Optional[float],
+    ) -> torch.Tensor:
+        target_samples = self._duration_seconds_to_samples(target_duration_seconds)
+        if target_samples is None:
+            return audio
+        current_samples = audio.shape[-1]
+        if current_samples == target_samples:
+            return audio
+        if current_samples > target_samples:
+            return audio[..., :target_samples].contiguous()
+        pad_shape = (*audio.shape[:-1], target_samples - current_samples)
+        padding = torch.zeros(pad_shape, device=audio.device, dtype=audio.dtype)
+        return torch.cat([audio, padding], dim=-1)
 
     def _segment_duration_targets(
         self,
@@ -387,12 +410,13 @@ class ConfuciusTTS:
         reference_mel: torch.Tensor,
         verbose: bool,
         target_duration_seconds: Optional[float] = None,
-    ) -> tuple[torch.Tensor, int, int, int]:
+    ) -> tuple[torch.Tensor, int, int, int, Optional[int]]:
         semantic_codes = t2s_out["semantic_codes"]  # (B, T_semantic)
         lm_latent = t2s_out["latent"]  # (B, T_semantic, D_hidden)
         self._log_t2s_output(semantic_codes, lm_latent, verbose)
 
         semantic_tokens = int(semantic_codes.shape[1])
+        target_samples = self._duration_seconds_to_samples(target_duration_seconds)
         target_length = self._duration_seconds_to_frames(target_duration_seconds)
         if target_length is None:
             target_length = int(semantic_tokens * 1.72)
@@ -413,12 +437,12 @@ class ConfuciusTTS:
                 f"Requested S2A duration needs {total_length} mel frames including "
                 f"the prompt, but this decoder supports at most {max_seq_len}."
             )
-        return cat_condition.squeeze(0), target_length, total_length, semantic_tokens
+        return cat_condition.squeeze(0), target_length, total_length, semantic_tokens, target_samples
 
     @torch.no_grad()
     def _decode_s2a_condition_batch(
         self,
-        prepared_conditions: list[tuple[torch.Tensor, int, int, int]],
+        prepared_conditions: list[tuple[torch.Tensor, int, int, int, Optional[int]]],
         reference_mel: torch.Tensor,
         style_embedding: torch.Tensor,
         n_timesteps: int,
@@ -428,7 +452,7 @@ class ConfuciusTTS:
         if not prepared_conditions:
             return [], 0
 
-        max_total_length = max(total_length for _, _, total_length, _ in prepared_conditions)
+        max_total_length = max(total_length for _, _, total_length, _, _ in prepared_conditions)
         condition_dim = prepared_conditions[0][0].shape[-1]
         batch_size = len(prepared_conditions)
         cat_condition = torch.zeros(
@@ -440,11 +464,19 @@ class ConfuciusTTS:
         )
         total_lengths = []
         target_lengths = []
+        target_samples = []
         semantic_token_total = 0
-        for index, (condition, target_length, total_length, semantic_tokens) in enumerate(prepared_conditions):
+        for index, (
+            condition,
+            target_length,
+            total_length,
+            semantic_tokens,
+            target_sample_count,
+        ) in enumerate(prepared_conditions):
             cat_condition[index, :total_length] = condition
             total_lengths.append(total_length)
             target_lengths.append(target_length)
+            target_samples.append(target_sample_count)
             semantic_token_total += semantic_tokens
 
         total_lengths_tensor = torch.tensor(total_lengths, device=self.device, dtype=torch.long)
@@ -472,9 +504,22 @@ class ConfuciusTTS:
 
         samples_per_frame = audio_batch.shape[-1] / mel.shape[-1]
         chunks = []
-        for index, target_length in enumerate(target_lengths):
-            audio_length = int(round(target_length * samples_per_frame))
-            chunks.append(audio_batch[index : index + 1, :audio_length].contiguous())
+        for index, (target_length, target_sample_count) in enumerate(zip(target_lengths, target_samples)):
+            audio_length = (
+                target_sample_count
+                if target_sample_count is not None
+                else int(round(target_length * samples_per_frame))
+            )
+            chunk = audio_batch[index : index + 1, :audio_length].contiguous()
+            if chunk.shape[-1] < audio_length:
+                pad = torch.zeros(
+                    chunk.shape[0],
+                    audio_length - chunk.shape[-1],
+                    device=chunk.device,
+                    dtype=chunk.dtype,
+                )
+                chunk = torch.cat([chunk, pad], dim=-1)
+            chunks.append(chunk)
         return chunks, semantic_token_total
 
     @torch.no_grad()
@@ -699,7 +744,7 @@ class ConfuciusTTS:
         n_timesteps: int = 10,
         inference_cfg_rate: float = 0.7,
         max_text_tokens_per_segment: int = 80,
-        segment_render_batch_size: int = 4,
+        segment_render_batch_size: int = 1,
         target_duration_seconds: Optional[float] = None,
         target_segment_durations: Optional[list[Optional[float]]] = None,
         cross_fade_duration: float = 0.3,
@@ -833,6 +878,9 @@ class ConfuciusTTS:
         with _StepTimer(self, timings, "merge_segments"):
             merged = cross_fade_concat(chunks, self.sample_rate,
                                        silence_duration=cross_fade_duration)
+        if target_duration_seconds is not None and target_duration_seconds > 0:
+            with _StepTimer(self, timings, "fit_target_duration"):
+                merged = self._fit_audio_to_duration(merged, target_duration_seconds)
 
         if return_timings:
             self._sync_device()
@@ -883,12 +931,12 @@ def main():
     parser.add_argument("--cross_fade_duration", type=float, default=0.3)
     parser.add_argument("--edge_fade_duration", type=float, default=0.1)
     parser.add_argument("--edge_pad_duration", type=float, default=0.1)
-    parser.add_argument("--segment_render_batch_size", type=int, default=4,
+    parser.add_argument("--segment_render_batch_size", type=int, default=1,
                         help="Number of vLLM text segments to batch for S2A/vocoder rendering.")
     parser.add_argument("--target_duration_seconds", type=float, default=0.0,
-                        help="Optional final output duration target in seconds. 0 disables duration control.")
+                        help="Optional final output duration target in seconds, sample-fitted for millisecond precision. 0 disables duration control.")
     parser.add_argument("--target_segment_durations", type=str, default="",
-                        help="Comma-separated per-segment duration targets in seconds.")
+                        help="Comma-separated per-segment duration targets in seconds, sample-fitted for millisecond precision.")
     parser.add_argument("--compile_s2a", action="store_true",
                         help="Compile the S2A diffusion estimator with torch.compile.")
     parser.add_argument("--verbose", action="store_true")

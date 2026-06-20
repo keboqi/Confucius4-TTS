@@ -193,8 +193,8 @@ def _format_timing_status(
         lines.insert(
             2,
             (
-                f"target_duration={target_duration:.2f}s, "
-                f"delta={generated_seconds - target_duration:+.2f}s"
+                f"target_duration={target_duration:.3f}s, "
+                f"delta={(generated_seconds - target_duration) * 1000:+.1f}ms"
             ),
         )
     for name, seconds in timing_info["steps"].items():
@@ -490,8 +490,12 @@ def build_demo() -> gr.Blocks:
                 max_length = gr.Slider(128, 2048, value=1520, step=16, label="Max semantic length")
                 max_text_tokens = gr.Slider(20, 240, value=80, step=5, label="Segment token limit")
             with gr.Row():
-                segment_render_batch_size = gr.Slider(1, 16, value=4, step=1, label="Render batch size")
-                target_duration_seconds = gr.Number(value=0.0, label="Target duration seconds")
+                segment_render_batch_size = gr.Slider(1, 16, value=1, step=1, label="Render batch size")
+                target_duration_seconds = gr.Number(
+                    value=0.0,
+                    precision=3,
+                    label="Target duration seconds",
+                )
                 cross_fade_duration = gr.Slider(0.0, 2.0, value=0.3, step=0.05, label="Cross fade seconds")
             target_segment_durations = gr.Textbox(
                 label="Segment durations CSV",
