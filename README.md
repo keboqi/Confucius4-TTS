@@ -146,6 +146,10 @@ python gradio_app.py \
     --concurrency-limit 100
 ```
 
+Add `--compile-s2a` to compile the S2A diffusion estimator with
+`torch.compile`. This can improve repeated-generation throughput after the
+first compile/warmup pass, but startup and the first request will take longer.
+
 `requirements-vllm.txt` also installs this repository in editable mode. This
 registers the Confucius custom T2S model as a `vllm.general_plugins` entry
 point, which is required because the Gradio service uses spawned vLLM engine
@@ -184,8 +188,9 @@ audio quality for your deployment.
 
 ### vLLM T2S Backend
 
-The vLLM path accelerates only the autoregressive Text2Semantic stage. Reference
-audio encoding, S2A diffusion, and BigVGAN remain in PyTorch.
+The vLLM path accelerates the autoregressive Text2Semantic stage. Reference
+audio encoding, S2A diffusion, and BigVGAN remain in PyTorch; S2A diffusion can
+also be wrapped with `torch.compile` via `--compile-s2a`.
 
 The converted T2S directory is required before starting the service:
 

@@ -66,6 +66,7 @@ class ConfuciusTTS:
         config_path: Path to YAML configuration file with model paths and audio parameters
         t2s_checkpoint: Optional path to T2S checkpoint (overrides config)
         device: Device for inference ("cuda" or "cpu")
+        compile_s2a: Compile the S2A diffusion estimator with torch.compile
     """
     def __init__(
         self,
@@ -78,6 +79,7 @@ class ConfuciusTTS:
         vllm_tensor_parallel_size: int = 1,
         vllm_dtype: str = "float32",
         vllm_attention_backend: Optional[str] = None,
+        compile_s2a: bool = False,
     ):
         self.device = torch.device(device)
         self.t2s_vllm = None
@@ -147,6 +149,8 @@ class ConfuciusTTS:
             torch.load(s2a_model_path, map_location="cpu", weights_only=False)
         )
         self.s2a_model.eval().to(self.device)
+        if compile_s2a:
+            self._compile_s2a_estimator()
 
         self.bigvgan = BigVGAN.from_pretrained(paths["vocoder_path"], use_cuda_kernel=False)
         self.bigvgan.remove_weight_norm()
@@ -171,6 +175,20 @@ class ConfuciusTTS:
     def _sync_device(self) -> None:
         if self.device.type == "cuda" and torch.cuda.is_available():
             torch.cuda.synchronize(self.device)
+
+    def _compile_s2a_estimator(self) -> None:
+        if not hasattr(torch, "compile"):
+            raise RuntimeError("torch.compile is not available in this PyTorch build.")
+        if self.device.type != "cuda":
+            raise RuntimeError("S2A torch.compile is only enabled for CUDA inference.")
+        print("[ConfuciusTTS] Compiling S2A diffusion estimator with torch.compile...")
+        self.s2a_model.decoder.estimator = torch.compile(
+            self.s2a_model.decoder.estimator,
+            fullgraph=True,
+            dynamic=True,
+            mode="reduce-overhead",
+        )
+        print("[ConfuciusTTS] S2A diffusion estimator compile wrapper is ready.")
 
     def _select_t2s_backend(self, use_vllm: Optional[bool]):
         if use_vllm is False:
@@ -289,6 +307,54 @@ class ConfuciusTTS:
                 return t2s_backend.generate(**kwargs), backend_name
         return t2s_backend.generate(**kwargs), backend_name
 
+    def _duration_seconds_to_frames(self, duration_seconds: Optional[float]) -> Optional[int]:
+        if duration_seconds is None or duration_seconds <= 0:
+            return None
+        return max(1, int(round(duration_seconds * self.sample_rate / self.hop_length)))
+
+    def _segment_duration_targets(
+        self,
+        segments: list[str],
+        target_duration_seconds: Optional[float],
+        target_segment_durations: Optional[list[Optional[float]]],
+        cross_fade_duration: float,
+    ) -> list[Optional[float]]:
+        if target_segment_durations is not None:
+            if len(target_segment_durations) != len(segments):
+                raise ValueError(
+                    "target_segment_durations must match the number of text segments "
+                    f"({len(segments)}), got {len(target_segment_durations)}."
+                )
+            return [
+                None if duration is None or duration <= 0 else float(duration)
+                for duration in target_segment_durations
+            ]
+
+        if target_duration_seconds is None or target_duration_seconds <= 0:
+            return [None] * len(segments)
+
+        inter_segment_silence = 0.0
+        if len(segments) > 1 and cross_fade_duration > 0:
+            silence_samples = int(cross_fade_duration * self.sample_rate) // 3
+            inter_segment_silence = (silence_samples / self.sample_rate) * (len(segments) - 1)
+        available_duration = float(target_duration_seconds) - inter_segment_silence
+        min_duration = len(segments) * self.hop_length / self.sample_rate
+        if available_duration < min_duration:
+            raise ValueError(
+                "target_duration_seconds is too short for the segmented output after "
+                "inter-segment silence. Reduce cross_fade_duration or increase the target."
+            )
+
+        weights = [
+            max(1, len(self.tokenizer.tokenize(segment)))
+            for segment in segments
+        ]
+        weight_total = sum(weights)
+        return [
+            available_duration * weight / weight_total
+            for weight in weights
+        ]
+
     def _log_t2s_output(
         self,
         semantic_codes: torch.Tensor,
@@ -315,6 +381,103 @@ class ConfuciusTTS:
         )
 
     @torch.no_grad()
+    def _prepare_s2a_condition(
+        self,
+        t2s_out: dict[str, torch.Tensor],
+        reference_mel: torch.Tensor,
+        verbose: bool,
+        target_duration_seconds: Optional[float] = None,
+    ) -> tuple[torch.Tensor, int, int, int]:
+        semantic_codes = t2s_out["semantic_codes"]  # (B, T_semantic)
+        lm_latent = t2s_out["latent"]  # (B, T_semantic, D_hidden)
+        self._log_t2s_output(semantic_codes, lm_latent, verbose)
+
+        semantic_tokens = int(semantic_codes.shape[1])
+        target_length = self._duration_seconds_to_frames(target_duration_seconds)
+        if target_length is None:
+            target_length = int(semantic_tokens * 1.72)
+        target_lengths = torch.tensor([target_length], device=self.device)
+
+        semantic_emb = self.s2a_model.input_embedding(semantic_codes).transpose(1, 2)
+        combined_features = torch.cat([lm_latent, semantic_emb], dim=-1)
+        text_cond = self.s2a_model.encoder_proj(combined_features)
+        cond_target, _ = self.s2a_model.length_regulator(text_cond, target_lengths)
+
+        prompt_length = reference_mel.size(1)
+        prompt_condition = self.s2a_model.prompt_cond.expand(1, prompt_length, -1)
+        cat_condition = torch.cat([prompt_condition, cond_target], dim=1)
+        total_length = prompt_length + target_length
+        max_seq_len = getattr(self.s2a_model.decoder.estimator, "max_seq_len", None)
+        if max_seq_len is not None and total_length > max_seq_len:
+            raise ValueError(
+                f"Requested S2A duration needs {total_length} mel frames including "
+                f"the prompt, but this decoder supports at most {max_seq_len}."
+            )
+        return cat_condition.squeeze(0), target_length, total_length, semantic_tokens
+
+    @torch.no_grad()
+    def _decode_s2a_condition_batch(
+        self,
+        prepared_conditions: list[tuple[torch.Tensor, int, int, int]],
+        reference_mel: torch.Tensor,
+        style_embedding: torch.Tensor,
+        n_timesteps: int,
+        inference_cfg_rate: float,
+        timings: Optional[OrderedDict[str, float]] = None,
+    ) -> tuple[list[torch.Tensor], int]:
+        if not prepared_conditions:
+            return [], 0
+
+        max_total_length = max(total_length for _, _, total_length, _ in prepared_conditions)
+        condition_dim = prepared_conditions[0][0].shape[-1]
+        batch_size = len(prepared_conditions)
+        cat_condition = torch.zeros(
+            batch_size,
+            max_total_length,
+            condition_dim,
+            device=self.device,
+            dtype=prepared_conditions[0][0].dtype,
+        )
+        total_lengths = []
+        target_lengths = []
+        semantic_token_total = 0
+        for index, (condition, target_length, total_length, semantic_tokens) in enumerate(prepared_conditions):
+            cat_condition[index, :total_length] = condition
+            total_lengths.append(total_length)
+            target_lengths.append(target_length)
+            semantic_token_total += semantic_tokens
+
+        total_lengths_tensor = torch.tensor(total_lengths, device=self.device, dtype=torch.long)
+        prompt_length = reference_mel.size(1)
+        prompt_batch = reference_mel.transpose(1, 2).expand(batch_size, -1, -1).contiguous()
+        style_batch = style_embedding.expand(batch_size, -1).contiguous()
+
+        with _StepTimer(self, timings, "s2a"):
+            mel = self.s2a_model.decoder.forward(
+                mu=cat_condition,
+                x_lens=total_lengths_tensor,
+                prompt=prompt_batch,
+                spks=style_batch,
+                n_timesteps=n_timesteps,
+                inference_cfg_rate=inference_cfg_rate,
+                temperature=1.0,
+            )
+            mel = mel[:, :, prompt_length:]
+            for index, target_length in enumerate(target_lengths):
+                if target_length < mel.shape[-1]:
+                    mel[index, :, target_length:] = 0
+
+        with _StepTimer(self, timings, "vocoder"):
+            audio_batch = self.bigvgan(mel.float().to(self.device)).squeeze(1)
+
+        samples_per_frame = audio_batch.shape[-1] / mel.shape[-1]
+        chunks = []
+        for index, target_length in enumerate(target_lengths):
+            audio_length = int(round(target_length * samples_per_frame))
+            chunks.append(audio_batch[index : index + 1, :audio_length].contiguous())
+        return chunks, semantic_token_total
+
+    @torch.no_grad()
     def _synth_audio_from_t2s(
         self,
         t2s_out: dict[str, torch.Tensor],
@@ -323,31 +486,24 @@ class ConfuciusTTS:
         n_timesteps: int,
         inference_cfg_rate: float,
         verbose: bool,
+        target_duration_seconds: Optional[float] = None,
         timings: Optional[OrderedDict[str, float]] = None,
     ) -> tuple[torch.Tensor, int]:
-        semantic_codes = t2s_out["semantic_codes"]  # (B, T_semantic)
-        lm_latent = t2s_out["latent"]  # (B, T_semantic, D_hidden)
-        self._log_t2s_output(semantic_codes, lm_latent, verbose)
-
-        # Predict target mel length (heuristic: 1.72x semantic length)
-        T = semantic_codes.shape[1]
-        target_lengths = torch.tensor([int(T * 1.72)], device=self.device)
-
-        # S2A: Generate mel-spectrogram from semantic tokens
-        with _StepTimer(self, timings, "s2a"):
-            mel = self.s2a_model.inference(
-                semantic_token=semantic_codes,
-                lm_latent=lm_latent,
-                prompt_feat=reference_mel,
-                embedding=style_embedding,
-                target_feat_len=target_lengths,
-                n_timesteps=n_timesteps,
-                inference_cfg_rate=inference_cfg_rate,
-            )
-        # Vocoder: mel to waveform.
-        with _StepTimer(self, timings, "vocoder"):
-            audio = self.bigvgan(mel.float().to(self.device)).squeeze(1)
-        return audio, T
+        prepared = self._prepare_s2a_condition(
+            t2s_out=t2s_out,
+            reference_mel=reference_mel,
+            verbose=verbose,
+            target_duration_seconds=target_duration_seconds,
+        )
+        chunks, semantic_token_total = self._decode_s2a_condition_batch(
+            prepared_conditions=[prepared],
+            reference_mel=reference_mel,
+            style_embedding=style_embedding,
+            n_timesteps=n_timesteps,
+            inference_cfg_rate=inference_cfg_rate,
+            timings=timings,
+        )
+        return chunks[0], semantic_token_total
 
     @torch.no_grad()
     def _synth_segment(
@@ -366,6 +522,7 @@ class ConfuciusTTS:
         n_timesteps: int,
         inference_cfg_rate: float,
         verbose: bool,
+        target_duration_seconds: Optional[float] = None,
         use_vllm: Optional[bool] = None,
         timings: Optional[OrderedDict[str, float]] = None,
     ) -> tuple[torch.Tensor, int]:
@@ -413,6 +570,7 @@ class ConfuciusTTS:
             n_timesteps=n_timesteps,
             inference_cfg_rate=inference_cfg_rate,
             verbose=verbose,
+            target_duration_seconds=target_duration_seconds,
             timings=timings,
         )
 
@@ -433,6 +591,8 @@ class ConfuciusTTS:
         n_timesteps: int,
         inference_cfg_rate: float,
         verbose: bool,
+        segment_render_batch_size: int,
+        target_segment_durations: list[Optional[float]],
         timings: Optional[OrderedDict[str, float]] = None,
     ) -> tuple[list[torch.Tensor], int]:
         if self.t2s_vllm is None:
@@ -469,6 +629,39 @@ class ConfuciusTTS:
         with _StepTimer(self, timings, "t2s_vllm"):
             t2s_outputs = self.t2s_vllm.generate_many(requests)
 
+        if segment_render_batch_size > 1:
+            chunks = []
+            semantic_token_total = 0
+            for start in range(0, len(t2s_outputs), segment_render_batch_size):
+                batch_outputs = t2s_outputs[start : start + segment_render_batch_size]
+                if verbose:
+                    end = start + len(batch_outputs)
+                    print(
+                        f"[ConfuciusTTS] rendering segments {start + 1}-{end}/"
+                        f"{len(segments)} as a batch"
+                    )
+                with _StepTimer(self, timings, "s2a_prepare"):
+                    prepared_conditions = [
+                        self._prepare_s2a_condition(
+                            t2s_out=t2s_out,
+                            reference_mel=reference_mel,
+                            verbose=verbose,
+                            target_duration_seconds=target_segment_durations[start + offset],
+                        )
+                        for offset, t2s_out in enumerate(batch_outputs)
+                    ]
+                batch_chunks, batch_semantic_tokens = self._decode_s2a_condition_batch(
+                    prepared_conditions=prepared_conditions,
+                    reference_mel=reference_mel,
+                    style_embedding=style_embedding,
+                    n_timesteps=n_timesteps,
+                    inference_cfg_rate=inference_cfg_rate,
+                    timings=timings,
+                )
+                chunks.extend(batch_chunks)
+                semantic_token_total += batch_semantic_tokens
+            return chunks, semantic_token_total
+
         chunks = []
         semantic_token_total = 0
         for i, t2s_out in enumerate(t2s_outputs):
@@ -481,6 +674,7 @@ class ConfuciusTTS:
                 n_timesteps=n_timesteps,
                 inference_cfg_rate=inference_cfg_rate,
                 verbose=verbose,
+                target_duration_seconds=target_segment_durations[i],
                 timings=timings,
             )
             semantic_token_total += semantic_tokens
@@ -502,9 +696,12 @@ class ConfuciusTTS:
         num_beams: int = 3,
         repetition_penalty: float = 10.0,
         max_length: int = 1520,
-        n_timesteps: int = 25,
+        n_timesteps: int = 10,
         inference_cfg_rate: float = 0.7,
         max_text_tokens_per_segment: int = 80,
+        segment_render_batch_size: int = 4,
+        target_duration_seconds: Optional[float] = None,
+        target_segment_durations: Optional[list[Optional[float]]] = None,
         cross_fade_duration: float = 0.3,
         edge_fade_duration: float = 0.1,
         edge_pad_duration: float = 0.1,
@@ -530,6 +727,9 @@ class ConfuciusTTS:
             n_timesteps: Number of diffusion steps for S2A (more = higher quality, slower)
             inference_cfg_rate: Classifier-free guidance scale (0 = unconditional, higher = stronger guidance)
             max_text_tokens_per_segment: Maximum tokens per segment before splitting
+            segment_render_batch_size: Number of vLLM segments to batch for S2A/vocoder rendering
+            target_duration_seconds: Optional final output duration target in seconds
+            target_segment_durations: Optional per-segment duration targets in seconds
             cross_fade_duration: Cross-fade duration between segments in seconds
             edge_fade_duration: Fade duration at start/end in seconds
             edge_pad_duration: Padding duration at edges in seconds
@@ -543,6 +743,7 @@ class ConfuciusTTS:
             self._sync_device()
         total_started = time.perf_counter()
         _, backend_name = self._select_t2s_backend(use_vllm)
+        segment_render_batch_size = max(1, int(segment_render_batch_size))
 
         # Normalize text (punctuation, numbers, etc.)
         with _StepTimer(self, timings, "normalize_text"):
@@ -577,6 +778,19 @@ class ConfuciusTTS:
             for i, seg in enumerate(segments):
                 print(f"[ConfuciusTTS] segment {i + 1}/{len(segments)}: {seg!r}")
 
+        segment_duration_targets = self._segment_duration_targets(
+            segments=segments,
+            target_duration_seconds=target_duration_seconds,
+            target_segment_durations=target_segment_durations,
+            cross_fade_duration=cross_fade_duration,
+        )
+        if verbose and any(duration is not None for duration in segment_duration_targets):
+            formatted_durations = [
+                None if duration is None else round(duration, 3)
+                for duration in segment_duration_targets
+            ]
+            print(f"[ConfuciusTTS] target segment durations: {formatted_durations}")
+
         if backend_name == "vllm" and len(segments) > 1:
             chunks, semantic_token_total = self._synth_segments_with_parallel_vllm(
                 segments=segments,
@@ -593,17 +807,20 @@ class ConfuciusTTS:
                 n_timesteps=n_timesteps,
                 inference_cfg_rate=inference_cfg_rate,
                 verbose=verbose,
+                segment_render_batch_size=segment_render_batch_size,
+                target_segment_durations=segment_duration_targets,
                 timings=timings,
             )
         else:
             # Synthesize each segment independently.
             chunks = []
             semantic_token_total = 0
-            for seg in segments:
+            for seg, target_segment_duration in zip(segments, segment_duration_targets):
                 audio, semantic_tokens = self._synth_segment(
                     seg, lang, semantic_features, style_embedding, reference_mel,
                     temperature, top_p, top_k, num_beams, repetition_penalty,
                     max_length, n_timesteps, inference_cfg_rate, verbose,
+                    target_duration_seconds=target_segment_duration,
                     use_vllm=use_vllm,
                     timings=timings,
                 )
@@ -623,6 +840,8 @@ class ConfuciusTTS:
                 "backend": "vLLM T2S" if backend_name == "vllm" else "Original PyTorch T2S",
                 "segments": len(segments),
                 "semantic_tokens": semantic_token_total,
+                "target_duration_seconds": target_duration_seconds,
+                "target_segment_durations": segment_duration_targets,
                 "steps": timings,
                 "total": time.perf_counter() - total_started,
             }
@@ -632,6 +851,18 @@ class ConfuciusTTS:
 
 def main():
     """CLI entry point for ConfuciusTTS inference."""
+    def parse_duration_csv(value: str | None) -> list[float] | None:
+        if value is None or not value.strip():
+            return None
+        durations = [
+            float(part.strip())
+            for part in value.replace("\n", ",").split(",")
+            if part.strip()
+        ]
+        if any(duration <= 0 for duration in durations):
+            raise ValueError("--target_segment_durations values must be positive seconds.")
+        return durations or None
+
     parser = argparse.ArgumentParser(description="ConfuciusTTS zero-shot inference")
     parser.add_argument("--text", type=str, required=True)
     parser.add_argument("--lang", type=str, default="zh")
@@ -652,6 +883,14 @@ def main():
     parser.add_argument("--cross_fade_duration", type=float, default=0.3)
     parser.add_argument("--edge_fade_duration", type=float, default=0.1)
     parser.add_argument("--edge_pad_duration", type=float, default=0.1)
+    parser.add_argument("--segment_render_batch_size", type=int, default=4,
+                        help="Number of vLLM text segments to batch for S2A/vocoder rendering.")
+    parser.add_argument("--target_duration_seconds", type=float, default=0.0,
+                        help="Optional final output duration target in seconds. 0 disables duration control.")
+    parser.add_argument("--target_segment_durations", type=str, default="",
+                        help="Comma-separated per-segment duration targets in seconds.")
+    parser.add_argument("--compile_s2a", action="store_true",
+                        help="Compile the S2A diffusion estimator with torch.compile.")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -665,12 +904,16 @@ def main():
         vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
         vllm_dtype=args.vllm_dtype,
         vllm_attention_backend=args.vllm_attention_backend,
+        compile_s2a=args.compile_s2a,
     )
     audio = model.generate(
         args.text, args.lang, args.prompt_wav,
         cross_fade_duration=args.cross_fade_duration,
         edge_fade_duration=args.edge_fade_duration,
         edge_pad_duration=args.edge_pad_duration,
+        segment_render_batch_size=args.segment_render_batch_size,
+        target_duration_seconds=args.target_duration_seconds,
+        target_segment_durations=parse_duration_csv(args.target_segment_durations),
         verbose=args.verbose,
     )
     torchaudio.save(args.output, audio.cpu(), model.sample_rate)

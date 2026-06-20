@@ -128,6 +128,7 @@ def _load_serving_model(
     vllm_tensor_parallel_size: int,
     vllm_dtype: str,
     vllm_attention_backend: Optional[str],
+    compile_s2a: bool,
 ) -> Any:
     try:
         from confuciustts.cli.inference import ConfuciusTTS
@@ -148,6 +149,7 @@ def _load_serving_model(
         vllm_tensor_parallel_size=vllm_tensor_parallel_size,
         vllm_dtype=vllm_dtype,
         vllm_attention_backend=vllm_attention_backend,
+        compile_s2a=compile_s2a,
     )
 
 
@@ -186,6 +188,15 @@ def _format_timing_status(
         "",
         "Timings:",
     ]
+    target_duration = timing_info.get("target_duration_seconds")
+    if target_duration is not None and target_duration > 0:
+        lines.insert(
+            2,
+            (
+                f"target_duration={target_duration:.2f}s, "
+                f"delta={generated_seconds - target_duration:+.2f}s"
+            ),
+        )
     for name, seconds in timing_info["steps"].items():
         lines.append(f"{name}: {seconds:.3f}s")
     lines.append(f"model_total: {timing_info['total']:.3f}s")
@@ -215,6 +226,23 @@ def _format_subprocess_error(process: subprocess.CompletedProcess[str]) -> str:
     return "\n".join(parts)
 
 
+def _parse_duration_csv(value: str) -> Optional[list[float]]:
+    value = (value or "").strip()
+    if not value:
+        return None
+    try:
+        durations = [
+            float(part.strip())
+            for part in value.replace("\n", ",").split(",")
+            if part.strip()
+        ]
+    except ValueError as exc:
+        raise gr.Error("Segment durations must be comma-separated numbers.") from exc
+    if any(duration <= 0 for duration in durations):
+        raise gr.Error("Segment durations must be positive seconds.")
+    return durations or None
+
+
 def _synthesize_original_subprocess(
     prompt_wav: str,
     text: str,
@@ -228,6 +256,8 @@ def _synthesize_original_subprocess(
     diffusion_steps: int,
     cfg_strength: float,
     max_text_tokens: int,
+    target_duration_seconds: float,
+    target_segment_durations: str,
     cross_fade_duration: float,
     verbose: bool,
 ) -> tuple[str, str, str]:
@@ -269,9 +299,14 @@ def _synthesize_original_subprocess(
         str(float(cfg_strength)),
         "--max-text-tokens",
         str(int(max_text_tokens)),
+        "--target-duration-seconds",
+        str(float(target_duration_seconds or 0.0)),
         "--cross-fade-duration",
         str(float(cross_fade_duration)),
     ]
+    target_segment_durations = (target_segment_durations or "").strip()
+    if target_segment_durations:
+        command.extend(["--target-segment-durations", target_segment_durations])
     if SERVE_T2S_CHECKPOINT is not None:
         command.extend(["--t2s-checkpoint", SERVE_T2S_CHECKPOINT])
     if verbose:
@@ -324,6 +359,9 @@ def _synthesize(
     diffusion_steps: int,
     cfg_strength: float,
     max_text_tokens: int,
+    segment_render_batch_size: int,
+    target_duration_seconds: float,
+    target_segment_durations: str,
     cross_fade_duration: float,
     verbose: bool,
 ) -> tuple[str, str, str]:
@@ -337,6 +375,7 @@ def _synthesize(
         raise gr.Error("Enter text to synthesize.")
 
     lang = _language_code(language)
+    target_segment_duration_values = _parse_duration_csv(target_segment_durations)
     if not use_vllm:
         return _synthesize_original_subprocess(
             prompt_wav=prompt_wav,
@@ -351,6 +390,8 @@ def _synthesize(
             diffusion_steps=int(diffusion_steps),
             cfg_strength=float(cfg_strength),
             max_text_tokens=int(max_text_tokens),
+            target_duration_seconds=float(target_duration_seconds or 0.0),
+            target_segment_durations=target_segment_durations,
             cross_fade_duration=float(cross_fade_duration),
             verbose=bool(verbose),
         )
@@ -372,6 +413,9 @@ def _synthesize(
         n_timesteps=int(diffusion_steps),
         inference_cfg_rate=float(cfg_strength),
         max_text_tokens_per_segment=int(max_text_tokens),
+        segment_render_batch_size=int(segment_render_batch_size),
+        target_duration_seconds=float(target_duration_seconds or 0.0),
+        target_segment_durations=target_segment_duration_values,
         cross_fade_duration=float(cross_fade_duration),
         verbose=bool(verbose),
         use_vllm=use_vllm,
@@ -440,12 +484,21 @@ def build_demo() -> gr.Blocks:
             with gr.Row():
                 num_beams = gr.Slider(1, 8, value=3, step=1, label="Beams")
                 repetition_penalty = gr.Slider(1.0, 20.0, value=10.0, step=0.5, label="Repetition penalty")
-                diffusion_steps = gr.Slider(1, 80, value=25, step=1, label="Diffusion steps")
+                diffusion_steps = gr.Slider(1, 80, value=10, step=1, label="Diffusion steps")
             with gr.Row():
                 cfg_strength = gr.Slider(0.0, 2.0, value=0.7, step=0.05, label="CFG strength")
                 max_length = gr.Slider(128, 2048, value=1520, step=16, label="Max semantic length")
                 max_text_tokens = gr.Slider(20, 240, value=80, step=5, label="Segment token limit")
-            cross_fade_duration = gr.Slider(0.0, 2.0, value=0.3, step=0.05, label="Cross fade seconds")
+            with gr.Row():
+                segment_render_batch_size = gr.Slider(1, 16, value=4, step=1, label="Render batch size")
+                target_duration_seconds = gr.Number(value=0.0, label="Target duration seconds")
+                cross_fade_duration = gr.Slider(0.0, 2.0, value=0.3, step=0.05, label="Cross fade seconds")
+            target_segment_durations = gr.Textbox(
+                label="Segment durations CSV",
+                value="",
+                lines=1,
+                max_lines=2,
+            )
 
         with gr.Accordion("Server settings", open=False):
             verbose = gr.Checkbox(label="Verbose inference logs", value=False)
@@ -473,6 +526,9 @@ def build_demo() -> gr.Blocks:
             diffusion_steps,
             cfg_strength,
             max_text_tokens,
+            segment_render_batch_size,
+            target_duration_seconds,
+            target_segment_durations,
             cross_fade_duration,
             verbose,
         ]
@@ -514,6 +570,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vllm-dtype", default=os.getenv("CONFUCIUS_VLLM_DTYPE", "float32"))
     parser.add_argument("--vllm-attention-backend",
                         default=os.getenv("CONFUCIUS_VLLM_ATTENTION_BACKEND", ""))
+    parser.add_argument("--compile-s2a", action="store_true",
+                        default=os.getenv("CONFUCIUS_COMPILE_S2A", "").lower() in {"1", "true", "yes", "on"})
     parser.add_argument("--concurrency-limit", type=int,
                         default=int(os.getenv("GRADIO_CONCURRENCY_LIMIT", "100")))
     return parser.parse_args()
@@ -552,6 +610,7 @@ def main() -> None:
         vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
         vllm_dtype=args.vllm_dtype,
         vllm_attention_backend=vllm_attention_backend,
+        compile_s2a=args.compile_s2a,
     )
     print("[Confucius4-TTS] vLLM-backed TTS model is ready.")
 
