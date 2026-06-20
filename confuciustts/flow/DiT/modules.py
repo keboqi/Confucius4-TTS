@@ -153,12 +153,12 @@ class Attention(nn.Module):
         self.wqkv = nn.Linear(dim, dim * 3, bias=False)
         self.wo = nn.Linear(dim, dim, bias=False)
 
-    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None, freqs_cis: torch.Tensor) -> torch.Tensor:
         """Multi-head self-attention with rotary embeddings.
 
         Args:
             x: Input tensor, shape (B, T, dim)
-            attn_mask: Attention mask, shape (B, 1, 1, T)
+            attn_mask: Optional attention mask, shape (B, 1, 1, T)
             freqs_cis: Rotary frequencies, shape (T, head_dim // 2, 2)
 
         Returns:
@@ -205,7 +205,7 @@ class DiTBlock(nn.Module):
         self,
         x: torch.Tensor,
         cond: torch.Tensor,
-        attn_mask: torch.Tensor,
+        attn_mask: torch.Tensor | None,
         freqs_cis: torch.Tensor,
         skip_in_x: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -214,7 +214,7 @@ class DiTBlock(nn.Module):
         Args:
             x: Input tensor, shape (B, T, dim)
             cond: Timestep conditioning, shape (B, dim)
-            attn_mask: Attention mask, shape (B, 1, 1, T)
+            attn_mask: Optional attention mask, shape (B, 1, 1, T)
             freqs_cis: Rotary frequencies, shape (T, head_dim // 2, 2)
             skip_in_x: Optional U-Net skip input, shape (B, T, dim)
 

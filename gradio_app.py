@@ -8,8 +8,10 @@ import hashlib
 import os
 import subprocess
 import sys
+import threading
 import time
 import wave
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Optional
 
@@ -25,6 +27,19 @@ SERVE_CONFIG_PATH: Optional[str] = None
 SERVE_T2S_CHECKPOINT: Optional[str] = None
 SERVE_COMPILE_S2A: Optional[bool] = None
 SERVE_USE_BIGVGAN_CUDA_KERNEL: Optional[bool] = None
+SERVE_S2A_DTYPE = "auto"
+SERVE_S2A_SDPA_BACKEND = "auto"
+SERVE_S2A_LENGTH_BUCKET_SIZE = 64
+SERVE_PROFILE_CUDA = False
+SERVE_PROFILE_DIR = "outputs/profiles"
+SERVE_VLLM_PREFIX_MODE = "auto"
+SERVE_VLLM_LATENT_MODE = "auto"
+SERVE_VLLM_HIDDEN_STATES_DIR: Optional[str] = None
+SERVE_GPU_STAGE_CONCURRENCY = 1
+SERVE_REFERENCE_CACHE_SIZE = 16
+SERVE_DETAILED_TIMINGS = False
+SERVE_POSTPROCESS_SEMAPHORE: Optional[threading.Semaphore] = None
+SERVE_ORIGINAL_SEMAPHORE: Optional[threading.Semaphore] = None
 
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
@@ -150,8 +165,18 @@ def _load_serving_model(
     vllm_tensor_parallel_size: int,
     vllm_dtype: str,
     vllm_attention_backend: Optional[str],
+    vllm_prefix_mode: str,
+    vllm_latent_mode: str,
+    vllm_hidden_states_dir: Optional[str],
     compile_s2a: Optional[bool],
     use_bigvgan_cuda_kernel: Optional[bool],
+    s2a_dtype: str,
+    s2a_sdpa_backend: str,
+    s2a_length_bucket_size: int,
+    profile_cuda: bool,
+    profile_dir: str,
+    gpu_stage_concurrency: int,
+    reference_cache_size: int,
 ) -> Any:
     try:
         from confuciustts.cli.inference import ConfuciusTTS
@@ -172,8 +197,18 @@ def _load_serving_model(
         vllm_tensor_parallel_size=vllm_tensor_parallel_size,
         vllm_dtype=vllm_dtype,
         vllm_attention_backend=vllm_attention_backend,
+        vllm_prefix_mode=vllm_prefix_mode,
+        vllm_latent_mode=vllm_latent_mode,
+        vllm_hidden_states_dir=vllm_hidden_states_dir,
         compile_s2a=compile_s2a,
         use_cuda_kernel=use_bigvgan_cuda_kernel,
+        s2a_dtype=s2a_dtype,
+        s2a_sdpa_backend=s2a_sdpa_backend,
+        s2a_length_bucket_size=s2a_length_bucket_size,
+        profile_cuda=profile_cuda,
+        profile_dir=profile_dir,
+        gpu_stage_concurrency=gpu_stage_concurrency,
+        reference_cache_size=reference_cache_size,
     )
 
 
@@ -292,6 +327,26 @@ def _format_timing_status(
     return "\n".join(lines)
 
 
+def _format_fast_status(
+    output: Path,
+    preview: Path,
+    audio: torch.Tensor,
+    sample_rate: int,
+    request_elapsed: float,
+) -> str:
+    generated_seconds = audio.shape[-1] / sample_rate
+    return "\n".join(
+        [
+            (
+                f"vLLM T2S generated {generated_seconds:.2f}s "
+                f"of audio in {request_elapsed:.2f}s on {SERVE_DEVICE}."
+            ),
+            f"wav={output}",
+            f"preview_mp3={preview}",
+        ]
+    )
+
+
 def _original_subprocess_env() -> dict[str, str]:
     env = os.environ.copy()
     pythonpath = env.get("PYTHONPATH")
@@ -356,6 +411,7 @@ def _synthesize_original_subprocess(
         sys.executable,
         "-m",
         "confuciustts.cli.run_inference",
+        "--no-use-vllm",
         "--text",
         text,
         "--lang",
@@ -390,7 +446,25 @@ def _synthesize_original_subprocess(
         str(float(target_duration_seconds or 0.0)),
         "--cross-fade-duration",
         str(float(cross_fade_duration)),
+        "--s2a-dtype",
+        SERVE_S2A_DTYPE,
+        "--s2a-sdpa-backend",
+        SERVE_S2A_SDPA_BACKEND,
+        "--s2a-length-bucket-size",
+        str(int(SERVE_S2A_LENGTH_BUCKET_SIZE)),
+        "--profile-dir",
+        SERVE_PROFILE_DIR,
+        "--vllm-prefix-mode",
+        SERVE_VLLM_PREFIX_MODE,
+        "--vllm-latent-mode",
+        SERVE_VLLM_LATENT_MODE,
+        "--gpu-stage-concurrency",
+        str(int(SERVE_GPU_STAGE_CONCURRENCY)),
+        "--reference-cache-size",
+        str(int(SERVE_REFERENCE_CACHE_SIZE)),
     ]
+    if SERVE_VLLM_HIDDEN_STATES_DIR:
+        command.extend(["--vllm-hidden-states-dir", SERVE_VLLM_HIDDEN_STATES_DIR])
     target_segment_durations = (target_segment_durations or "").strip()
     if target_segment_durations:
         command.extend(["--target-segment-durations", target_segment_durations])
@@ -404,17 +478,20 @@ def _synthesize_original_subprocess(
         command.append("--use-bigvgan-cuda-kernel")
     elif SERVE_USE_BIGVGAN_CUDA_KERNEL is False:
         command.append("--no-use-bigvgan-cuda-kernel")
+    if SERVE_PROFILE_CUDA:
+        command.append("--profile-cuda")
     if verbose:
         command.append("--verbose")
 
     started = time.perf_counter()
-    process = subprocess.run(
-        command,
-        cwd=str(ROOT_DIR),
-        env=_original_subprocess_env(),
-        capture_output=True,
-        text=True,
-    )
+    with (SERVE_ORIGINAL_SEMAPHORE or nullcontext()):
+        process = subprocess.run(
+            command,
+            cwd=str(ROOT_DIR),
+            env=_original_subprocess_env(),
+            capture_output=True,
+            text=True,
+        )
     request_elapsed = time.perf_counter() - started
     if process.returncode != 0:
         raise gr.Error(_format_subprocess_error(process))
@@ -502,7 +579,7 @@ def _synthesize(
     backend_slug = "vllm"
 
     started = time.perf_counter()
-    audio, timing_info = model.generate(
+    result = model.generate(
         text=text,
         lang=lang,
         prompt_wav=prompt_wav,
@@ -521,30 +598,46 @@ def _synthesize(
         cross_fade_duration=float(cross_fade_duration),
         verbose=bool(verbose),
         use_vllm=use_vllm,
-        return_timings=True,
+        return_timings=SERVE_DETAILED_TIMINGS,
     )
+    if SERVE_DETAILED_TIMINGS:
+        audio, timing_info = result
+    else:
+        audio = result
+        timing_info = None
 
     output = _output_path(prompt_wav, backend_slug)
-    save_started = time.perf_counter()
-    if torch.cuda.is_available() and model.device.type == "cuda":
-        torch.cuda.synchronize(model.device)
-    audio_cpu = audio.detach().float().cpu()
-    torchaudio.save(str(output), audio_cpu, model.sample_rate)
-    save_elapsed = time.perf_counter() - save_started
-    preview_started = time.perf_counter()
-    preview_output = _save_mp3_preview(output, audio_cpu, model.sample_rate)
-    preview_elapsed = time.perf_counter() - preview_started
+    with (SERVE_POSTPROCESS_SEMAPHORE or nullcontext()):
+        save_started = time.perf_counter()
+        if SERVE_DETAILED_TIMINGS and torch.cuda.is_available() and model.device.type == "cuda":
+            torch.cuda.synchronize(model.device)
+        audio_cpu = audio.detach().float().cpu()
+        torchaudio.save(str(output), audio_cpu, model.sample_rate)
+        save_elapsed = time.perf_counter() - save_started
+        preview_started = time.perf_counter()
+        preview_output = _save_mp3_preview(output, audio_cpu, model.sample_rate)
+        preview_elapsed = time.perf_counter() - preview_started
 
-    status = _format_timing_status(
-        output=output,
-        preview=preview_output,
-        audio=audio,
-        sample_rate=model.sample_rate,
-        timing_info=timing_info,
-        save_elapsed=save_elapsed,
-        preview_elapsed=preview_elapsed,
-        request_elapsed=time.perf_counter() - started,
-    )
+    request_elapsed = time.perf_counter() - started
+    if SERVE_DETAILED_TIMINGS and timing_info is not None:
+        status = _format_timing_status(
+            output=output,
+            preview=preview_output,
+            audio=audio,
+            sample_rate=model.sample_rate,
+            timing_info=timing_info,
+            save_elapsed=save_elapsed,
+            preview_elapsed=preview_elapsed,
+            request_elapsed=request_elapsed,
+        )
+    else:
+        status = _format_fast_status(
+            output=output,
+            preview=preview_output,
+            audio=audio,
+            sample_rate=model.sample_rate,
+            request_elapsed=request_elapsed,
+        )
     return str(preview_output), str(output), status
 
 
@@ -678,9 +771,17 @@ def parse_args() -> argparse.Namespace:
                         default=float(os.getenv("CONFUCIUS_VLLM_GPU_MEMORY_UTILIZATION", "0.25")))
     parser.add_argument("--vllm-tensor-parallel-size", type=int,
                         default=int(os.getenv("CONFUCIUS_VLLM_TENSOR_PARALLEL_SIZE", "1")))
-    parser.add_argument("--vllm-dtype", default=os.getenv("CONFUCIUS_VLLM_DTYPE", "float32"))
+    parser.add_argument("--vllm-dtype", default=os.getenv("CONFUCIUS_VLLM_DTYPE", "auto"))
     parser.add_argument("--vllm-attention-backend",
                         default=os.getenv("CONFUCIUS_VLLM_ATTENTION_BACKEND", ""))
+    parser.add_argument("--vllm-prefix-mode", default=os.getenv("CONFUCIUS_VLLM_PREFIX_MODE", "auto"),
+                        choices=["auto", "embeds", "worker"],
+                        help="How vLLM receives the T2S prefix. worker requires a freshly converted vLLM model.")
+    parser.add_argument("--vllm-latent-mode", default=os.getenv("CONFUCIUS_VLLM_LATENT_MODE", "auto"),
+                        choices=["auto", "vllm", "pytorch"],
+                        help="How vLLM mode obtains T2S latents for S2A.")
+    parser.add_argument("--vllm-hidden-states-dir",
+                        default=os.getenv("CONFUCIUS_VLLM_HIDDEN_STATES_DIR", ""))
     parser.add_argument("--compile-s2a", "--use-torch-compile", "--use_torch_compile",
                         action=argparse.BooleanOptionalAction, dest="compile_s2a",
                         default=_env_optional_bool(
@@ -694,6 +795,32 @@ def parse_args() -> argparse.Namespace:
                             "CONFUCIUS_BIGVGAN_USE_CUDA_KERNEL",
                         ),
                         help="Use BigVGAN's fused CUDA activation kernel. Defaults to enabled on CUDA.")
+    parser.add_argument("--s2a-dtype", default=os.getenv("CONFUCIUS_S2A_DTYPE", "auto"),
+                        choices=["auto", "float32", "bfloat16", "float16", "bf16", "fp16", "fp32"],
+                        help="S2A inference dtype.")
+    parser.add_argument("--s2a-sdpa-backend", default=os.getenv("CONFUCIUS_S2A_SDPA_BACKEND", "auto"),
+                        choices=["auto", "flash", "efficient", "math", "cudnn"],
+                        help="Optional PyTorch SDPA backend override for S2A DiT attention.")
+    parser.add_argument("--s2a-length-bucket-size", type=int,
+                        default=int(os.getenv("CONFUCIUS_S2A_LENGTH_BUCKET_SIZE", "64")),
+                        help="Bucket multi-segment S2A batches by total mel length. 0 disables bucketing.")
+    parser.add_argument("--profile-cuda", action=argparse.BooleanOptionalAction,
+                        default=_env_bool("CONFUCIUS_PROFILE_CUDA", False),
+                        help="Write torch profiler traces for S2A and BigVGAN stages.")
+    parser.add_argument("--profile-dir", default=os.getenv("CONFUCIUS_PROFILE_DIR", "outputs/profiles"),
+                        help="Directory for CUDA profiler traces.")
+    parser.add_argument("--gpu-stage-concurrency", type=int,
+                        default=int(os.getenv("CONFUCIUS_GPU_STAGE_CONCURRENCY", "1")),
+                        help="Maximum concurrent non-vLLM GPU stages per process.")
+    parser.add_argument("--reference-cache-size", type=int,
+                        default=int(os.getenv("CONFUCIUS_REFERENCE_CACHE_SIZE", "16")),
+                        help="Number of reference-audio conditioning entries to cache per process.")
+    parser.add_argument("--postprocess-concurrency", type=int,
+                        default=int(os.getenv("CONFUCIUS_POSTPROCESS_CONCURRENCY", "2")),
+                        help="Maximum concurrent WAV/MP3 postprocess jobs.")
+    parser.add_argument("--detailed-timings", action=argparse.BooleanOptionalAction,
+                        default=_env_bool("CONFUCIUS_DETAILED_TIMINGS", False),
+                        help="Return synchronized per-stage CUDA timings in Gradio status.")
     parser.add_argument("--concurrency-limit", type=int,
                         default=int(os.getenv("GRADIO_CONCURRENCY_LIMIT", "100")))
     return parser.parse_args()
@@ -702,6 +829,13 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     global SERVE_COMPILE_S2A, SERVE_CONFIG_PATH, SERVE_DEVICE, SERVE_MODEL
     global SERVE_T2S_CHECKPOINT, SERVE_USE_BIGVGAN_CUDA_KERNEL
+    global SERVE_PROFILE_CUDA, SERVE_PROFILE_DIR, SERVE_S2A_DTYPE
+    global SERVE_S2A_LENGTH_BUCKET_SIZE, SERVE_S2A_SDPA_BACKEND
+    global SERVE_DETAILED_TIMINGS, SERVE_GPU_STAGE_CONCURRENCY
+    global SERVE_ORIGINAL_SEMAPHORE
+    global SERVE_POSTPROCESS_SEMAPHORE, SERVE_REFERENCE_CACHE_SIZE
+    global SERVE_VLLM_HIDDEN_STATES_DIR, SERVE_VLLM_LATENT_MODE
+    global SERVE_VLLM_PREFIX_MODE
 
     args = parse_args()
     config_path = _resolve_repo_path(args.config, "Config")
@@ -715,12 +849,34 @@ def main() -> None:
         )
     if args.concurrency_limit < 1:
         raise gr.Error("--concurrency-limit must be at least 1.")
+    if args.s2a_length_bucket_size < 0:
+        raise gr.Error("--s2a-length-bucket-size must be zero or greater.")
+    if args.gpu_stage_concurrency < 1:
+        raise gr.Error("--gpu-stage-concurrency must be at least 1.")
+    if args.reference_cache_size < 0:
+        raise gr.Error("--reference-cache-size must be zero or greater.")
+    if args.postprocess_concurrency < 1:
+        raise gr.Error("--postprocess-concurrency must be at least 1.")
     t2s_checkpoint = _normalize_checkpoint(args.t2s_checkpoint)
     vllm_attention_backend = _normalize_optional_text(args.vllm_attention_backend)
+    vllm_hidden_states_dir = _normalize_optional_text(args.vllm_hidden_states_dir)
     SERVE_CONFIG_PATH = config_path
     SERVE_T2S_CHECKPOINT = t2s_checkpoint
     SERVE_COMPILE_S2A = args.compile_s2a
     SERVE_USE_BIGVGAN_CUDA_KERNEL = args.use_bigvgan_cuda_kernel
+    SERVE_S2A_DTYPE = args.s2a_dtype
+    SERVE_S2A_SDPA_BACKEND = args.s2a_sdpa_backend
+    SERVE_S2A_LENGTH_BUCKET_SIZE = max(0, int(args.s2a_length_bucket_size))
+    SERVE_PROFILE_CUDA = bool(args.profile_cuda)
+    SERVE_PROFILE_DIR = args.profile_dir
+    SERVE_VLLM_PREFIX_MODE = args.vllm_prefix_mode
+    SERVE_VLLM_LATENT_MODE = args.vllm_latent_mode
+    SERVE_VLLM_HIDDEN_STATES_DIR = vllm_hidden_states_dir
+    SERVE_GPU_STAGE_CONCURRENCY = int(args.gpu_stage_concurrency)
+    SERVE_REFERENCE_CACHE_SIZE = int(args.reference_cache_size)
+    SERVE_DETAILED_TIMINGS = bool(args.detailed_timings)
+    SERVE_POSTPROCESS_SEMAPHORE = threading.Semaphore(int(args.postprocess_concurrency))
+    SERVE_ORIGINAL_SEMAPHORE = threading.Semaphore(SERVE_GPU_STAGE_CONCURRENCY)
     compile_s2a_label = "auto" if SERVE_COMPILE_S2A is None else str(SERVE_COMPILE_S2A)
     bigvgan_kernel_label = (
         "auto"
@@ -732,7 +888,15 @@ def main() -> None:
         "[Confucius4-TTS] Loading always-on vLLM T2S backend "
         f"from {vllm_model_dir} on {SERVE_DEVICE} "
         f"(compile_s2a={compile_s2a_label}, "
-        f"use_bigvgan_cuda_kernel={bigvgan_kernel_label})..."
+        f"use_bigvgan_cuda_kernel={bigvgan_kernel_label}, "
+        f"vllm_prefix_mode={SERVE_VLLM_PREFIX_MODE}, "
+        f"vllm_latent_mode={SERVE_VLLM_LATENT_MODE}, "
+        f"gpu_stage_concurrency={SERVE_GPU_STAGE_CONCURRENCY}, "
+        f"reference_cache_size={SERVE_REFERENCE_CACHE_SIZE}, "
+        f"detailed_timings={SERVE_DETAILED_TIMINGS}, "
+        f"s2a_dtype={SERVE_S2A_DTYPE}, "
+        f"s2a_sdpa_backend={SERVE_S2A_SDPA_BACKEND}, "
+        f"s2a_length_bucket_size={SERVE_S2A_LENGTH_BUCKET_SIZE})..."
     )
     SERVE_MODEL = _load_serving_model(
         config_path=config_path,
@@ -743,8 +907,18 @@ def main() -> None:
         vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
         vllm_dtype=args.vllm_dtype,
         vllm_attention_backend=vllm_attention_backend,
+        vllm_prefix_mode=args.vllm_prefix_mode,
+        vllm_latent_mode=args.vllm_latent_mode,
+        vllm_hidden_states_dir=vllm_hidden_states_dir,
         compile_s2a=args.compile_s2a,
         use_bigvgan_cuda_kernel=args.use_bigvgan_cuda_kernel,
+        s2a_dtype=args.s2a_dtype,
+        s2a_sdpa_backend=args.s2a_sdpa_backend,
+        s2a_length_bucket_size=SERVE_S2A_LENGTH_BUCKET_SIZE,
+        profile_cuda=args.profile_cuda,
+        profile_dir=args.profile_dir,
+        gpu_stage_concurrency=SERVE_GPU_STAGE_CONCURRENCY,
+        reference_cache_size=SERVE_REFERENCE_CACHE_SIZE,
     )
     print("[Confucius4-TTS] vLLM-backed TTS model is ready.")
 

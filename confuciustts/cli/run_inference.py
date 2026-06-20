@@ -40,24 +40,49 @@ def parse_args():
                    help="Override T2S checkpoint path from config")
     p.add_argument("--device", type=str, default="cuda",
                    help="Device for inference (cuda or cpu)")
-    p.add_argument("--use-vllm", action="store_true",
-                   help="Use vLLM for the autoregressive T2S semantic decoder")
+    p.add_argument("--use-vllm", action=argparse.BooleanOptionalAction, default=None,
+                   help="Use vLLM for the autoregressive T2S semantic decoder. Defaults to auto on CUDA when the converted model exists")
     p.add_argument("--vllm-model-dir", type=str, default=None,
                    help="Converted T2S vLLM directory from tools/convert_t2s_vllm.py")
     p.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.25,
                    help="vLLM GPU memory utilization")
     p.add_argument("--vllm-tensor-parallel-size", type=int, default=1,
                    help="vLLM tensor parallel size")
-    p.add_argument("--vllm-dtype", type=str, default="float32",
+    p.add_argument("--vllm-dtype", type=str, default="auto",
                    help="vLLM dtype argument")
     p.add_argument("--vllm-attention-backend", type=str, default=None,
                    help="Optional vLLM attention backend override, e.g. FLASHINFER or FLASH_ATTN")
+    p.add_argument("--vllm-prefix-mode", default="auto",
+                   choices=["auto", "embeds", "worker"],
+                   help="How vLLM receives the T2S prefix. worker requires a freshly converted vLLM model")
+    p.add_argument("--vllm-latent-mode", default="auto",
+                   choices=["auto", "vllm", "pytorch"],
+                   help="How vLLM mode obtains T2S latents for S2A")
+    p.add_argument("--vllm-hidden-states-dir", default=None,
+                   help="Directory for temporary vLLM hidden-state extraction files")
     p.add_argument("--compile-s2a", "--use-torch-compile", "--use_torch_compile",
                    action=argparse.BooleanOptionalAction, default=None, dest="compile_s2a",
                    help="Compile the S2A diffusion estimator with torch.compile. Defaults to enabled on CUDA")
     p.add_argument("--use-bigvgan-cuda-kernel", action=argparse.BooleanOptionalAction,
                    default=None,
                    help="Use BigVGAN's fused CUDA activation kernel. Defaults to enabled on CUDA")
+    p.add_argument("--s2a-dtype", default="auto",
+                   choices=["auto", "float32", "bfloat16", "float16", "bf16", "fp16", "fp32"],
+                   help="S2A inference dtype")
+    p.add_argument("--s2a-sdpa-backend", default="auto",
+                   choices=["auto", "flash", "efficient", "math", "cudnn"],
+                   help="Optional PyTorch SDPA backend override for S2A DiT attention")
+    p.add_argument("--s2a-length-bucket-size", type=int, default=64,
+                   help="Bucket multi-segment S2A batches by total mel length. 0 disables bucketing")
+    p.add_argument("--profile-cuda", action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help="Write torch profiler traces for S2A and BigVGAN stages")
+    p.add_argument("--profile-dir", default="outputs/profiles",
+                   help="Directory for CUDA profiler traces")
+    p.add_argument("--gpu-stage-concurrency", type=int, default=1,
+                   help="Maximum concurrent non-vLLM GPU stages per process")
+    p.add_argument("--reference-cache-size", type=int, default=16,
+                   help="Number of reference-audio conditioning entries to cache per process")
     p.add_argument("--temperature", type=float, default=0.8,
                    help="Sampling temperature for T2S generation (higher = more diverse)")
     p.add_argument("--top-p", type=float, default=0.8,
@@ -101,8 +126,18 @@ def main():
         vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
         vllm_dtype=args.vllm_dtype,
         vllm_attention_backend=args.vllm_attention_backend,
+        vllm_prefix_mode=args.vllm_prefix_mode,
+        vllm_latent_mode=args.vllm_latent_mode,
+        vllm_hidden_states_dir=args.vllm_hidden_states_dir,
         compile_s2a=args.compile_s2a,
         use_cuda_kernel=args.use_bigvgan_cuda_kernel,
+        s2a_dtype=args.s2a_dtype,
+        s2a_sdpa_backend=args.s2a_sdpa_backend,
+        s2a_length_bucket_size=args.s2a_length_bucket_size,
+        profile_cuda=args.profile_cuda,
+        profile_dir=args.profile_dir,
+        gpu_stage_concurrency=args.gpu_stage_concurrency,
+        reference_cache_size=args.reference_cache_size,
     )
     t0 = time.time()
     audio = model.generate(

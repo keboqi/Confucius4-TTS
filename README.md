@@ -141,10 +141,14 @@ python gradio_app.py \
     --device cuda \
     --config config/inference_config.yaml \
     --vllm-model-dir checkpoints/t2s-vllm \
-    --vllm-dtype float32 \
     --vllm-gpu-memory-utilization 0.25 \
     --concurrency-limit 100
 ```
+
+The optimized serving settings are defaults: vLLM uses automatic dtype
+selection, S2A uses automatic reduced precision on CUDA, S2A length bucketing is
+enabled, reference conditioning caches 16 audio prompts, and synchronized CUDA
+stage timings stay off unless requested.
 
 S2A diffusion uses `torch.compile` by default on CUDA. This can improve
 repeated-generation throughput after the first compile/warmup pass, but startup
@@ -153,6 +157,15 @@ The launcher also accepts the IndexTTS-style alias `--use-torch-compile`.
 The S2A compile path keeps Inductor kernels enabled but disables Inductor CUDA
 graph capture because prompt/text-dependent dynamic shapes can otherwise create
 many graph recordings and fail inside Gradio worker threads.
+
+S2A DiT attention uses PyTorch SDPA. By default PyTorch chooses the backend, but
+you can force a backend for validation with `--s2a-sdpa-backend flash`,
+`efficient`, `math`, or `cudnn`. S2A dtype defaults to `auto`, which chooses
+`bfloat16` on CUDA when supported and falls back to `float32` otherwise; use
+`--s2a-dtype float32` if you need the previous conservative path. For
+multi-segment rendering, `--s2a-length-bucket-size` defaults to `64` to group
+similarly sized S2A batches and reduce padding. Use `--profile-cuda` to write torch
+profiler traces for the S2A and BigVGAN stages under `outputs/profiles/`.
 
 BigVGAN uses NVIDIA's fused CUDA activation kernel automatically on CUDA,
 matching the IndexTTS fast path. Use `--no-use-bigvgan-cuda-kernel` to disable
@@ -171,6 +184,26 @@ testing; larger values remain available for experiments.
 registers the Confucius custom T2S model as a `vllm.general_plugins` entry
 point, which is required because the Gradio service uses spawned vLLM engine
 workers.
+
+New vLLM exports include the T2S prefix modules inside the vLLM worker. Re-run
+`tools/convert_t2s_vllm.py` after upgrading to enable `--vllm-prefix-mode auto`
+to avoid building large prefix embeddings in the serving process. Older exports
+still work, but automatically fall back to `embeds` mode.
+
+The vLLM backend can also avoid the duplicate PyTorch T2S transformer latent
+pass when the installed vLLM build exposes hidden-state extraction. The default
+`--vllm-latent-mode auto` tries that path and falls back to the PyTorch latent
+pass if unsupported; use `--vllm-latent-mode pytorch` for the previous behavior
+or `vllm` to require the new path.
+
+Non-vLLM GPU stages are throttled with `--gpu-stage-concurrency` so Wav2Vec2,
+CAMPPlus, S2A, and BigVGAN do not all run concurrently across many Gradio
+requests. Reference conditioning is cached by audio content hash; tune the LRU
+size with `--reference-cache-size`.
+
+Gradio no longer requests synchronized per-stage CUDA timings by default. Use
+`--detailed-timings` only when profiling; normal serving reports request-level
+latency without forcing `_StepTimer` CUDA synchronizations.
 
 By default vLLM selects the first compatible attention backend. On Blackwell
 this normally means FlashInfer first, then FlashAttention, then Triton. The
@@ -199,9 +232,9 @@ The UI accepts a reference audio file, synthesis text, language selection,
 and advanced generation settings. Generated WAV files are saved under
 `outputs/gradio/`.
 
-The T2S checkpoint is trained and validated in FP32. The service defaults to
-`--vllm-dtype float32`; avoid vLLM `auto` downcasting unless you have validated
-audio quality for your deployment.
+The service defaults to vLLM `auto` dtype for throughput. Use
+`--vllm-dtype float32` if a deployment needs the previous conservative T2S
+precision path.
 
 ### vLLM T2S Backend
 

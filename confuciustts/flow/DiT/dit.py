@@ -165,7 +165,7 @@ class DiT(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        mask: torch.Tensor,
+        mask: torch.Tensor | None,
         mu: torch.Tensor,
         t: torch.Tensor,
         spks: torch.Tensor | None = None,
@@ -175,7 +175,7 @@ class DiT(nn.Module):
 
         Args:
             x: Noisy mel-spectrogram, shape (B, mel_dim, T)
-            mask: Padding mask, shape (B, 1, T)
+            mask: Optional padding mask, shape (B, T)
             mu: Semantic/text conditioning, shape (B, T, cond_dim)
             t: Diffusion timestep, shape (B,)
             spks: Speaker embedding, shape (B, spk_dim) or None
@@ -202,7 +202,7 @@ class DiT(nn.Module):
         t1 = self.t_embedder(t)  # Timestep embedding
         x_in = self.input_embed(x, cond, mu, spks)
 
-        attn_mask = mask.view(bsz, 1, 1, seq_len)
+        attn_mask = None if mask is None else mask.view(bsz, 1, 1, seq_len)
 
         freqs_cis = self.freqs_cis[:seq_len]
 
@@ -225,7 +225,11 @@ class DiT(nn.Module):
             # WaveNet-based final layer
             x_out = self.conv1(x_res).transpose(1, 2)
             t2 = self.t_embedder2(t)
-            x_mask = mask.unsqueeze(1).to(x_out.dtype)
+            x_mask = (
+                x_out.new_ones((bsz, 1, seq_len))
+                if mask is None
+                else mask.unsqueeze(1).to(x_out.dtype)
+            )
             x_out = self.wavenet(x_out, x_mask, g=t2.unsqueeze(2))
             x_out = x_out.transpose(1, 2) + self.res_projection(x_res)
             x_out = self.final_layer(x_out, t1).transpose(1, 2)

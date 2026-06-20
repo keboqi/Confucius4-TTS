@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import os
 import sys
 import threading
@@ -6,6 +7,7 @@ import time
 import traceback
 import warnings
 from collections import OrderedDict
+from pathlib import Path
 from typing import Any, Optional
 
 import safetensors.torch
@@ -55,6 +57,65 @@ class _StepTimer:
             self.timings[self.name] = self.timings.get(self.name, 0.0) + elapsed
 
 
+class _CudaProfiler:
+    def __init__(self, owner: "ConfuciusTTS", name: str) -> None:
+        self.owner = owner
+        self.name = name
+        self.profiler = None
+
+    def __enter__(self) -> "_CudaProfiler":
+        if not self.owner.profile_cuda:
+            return self
+        try:
+            activities = [torch.profiler.ProfilerActivity.CPU]
+            if self.owner.device.type == "cuda" and torch.cuda.is_available():
+                activities.append(torch.profiler.ProfilerActivity.CUDA)
+            self.profiler = torch.profiler.profile(
+                activities=activities,
+                record_shapes=True,
+                with_stack=False,
+                profile_memory=True,
+            )
+            self.profiler.__enter__()
+        except Exception:
+            traceback.print_exc()
+            print(f"[ConfuciusTTS] CUDA profiler disabled for {self.name}.", flush=True)
+            self.owner.profile_cuda = False
+            self.profiler = None
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self.profiler is None:
+            return
+        self.profiler.__exit__(exc_type, exc, tb)
+        try:
+            trace_path = self.owner._next_profile_path(self.name)
+            self.profiler.export_chrome_trace(str(trace_path))
+            sort_by = "cuda_time_total" if self.owner.device.type == "cuda" else "cpu_time_total"
+            table = self.profiler.key_averages().table(sort_by=sort_by, row_limit=20)
+            print(
+                f"[ConfuciusTTS] {self.name} profiler trace: {trace_path}\n{table}",
+                flush=True,
+            )
+        except Exception:
+            traceback.print_exc()
+            print(f"[ConfuciusTTS] Failed to export {self.name} profiler trace.", flush=True)
+
+
+class _SemaphoreGuard:
+    def __init__(self, semaphore: Optional[threading.Semaphore]) -> None:
+        self.semaphore = semaphore
+
+    def __enter__(self) -> "_SemaphoreGuard":
+        if self.semaphore is not None:
+            self.semaphore.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self.semaphore is not None:
+            self.semaphore.release()
+
+
 class ConfuciusTTS:
     """Zero-shot multilingual TTS system based on a two-stage architecture.
 
@@ -76,18 +137,43 @@ class ConfuciusTTS:
         config_path: str = "config/inference_config.yaml",
         t2s_checkpoint: Optional[str] = None,
         device: str = "cuda",
-        use_vllm: bool = False,
+        use_vllm: Optional[bool] = None,
         vllm_model_dir: Optional[str] = None,
         vllm_gpu_memory_utilization: float = 0.25,
         vllm_tensor_parallel_size: int = 1,
-        vllm_dtype: str = "float32",
+        vllm_dtype: str = "auto",
         vllm_attention_backend: Optional[str] = None,
+        vllm_prefix_mode: str = "auto",
+        vllm_latent_mode: str = "auto",
+        vllm_hidden_states_dir: Optional[str] = None,
         compile_s2a: Optional[bool] = None,
         use_cuda_kernel: Optional[bool] = None,
+        s2a_dtype: str = "auto",
+        s2a_sdpa_backend: str = "auto",
+        s2a_length_bucket_size: int = 64,
+        profile_cuda: bool = False,
+        profile_dir: Optional[str] = None,
+        gpu_stage_concurrency: int = 1,
+        reference_cache_size: int = 16,
     ):
         self.device = torch.device(device)
         self.compile_s2a = self._resolve_compile_s2a(compile_s2a)
         self.use_cuda_kernel = self._resolve_bigvgan_cuda_kernel(use_cuda_kernel)
+        self._s2a_dtype_name = (s2a_dtype or "auto").strip().lower()
+        self.s2a_sdpa_backend = self._resolve_s2a_sdpa_backend(s2a_sdpa_backend)
+        self.s2a_length_bucket_size = max(0, int(s2a_length_bucket_size or 0))
+        self.profile_cuda = bool(profile_cuda)
+        self.profile_dir = Path(profile_dir or "outputs/profiles")
+        self._profile_counter = 0
+        self.gpu_stage_concurrency = max(1, int(gpu_stage_concurrency or 1))
+        self._gpu_stage_semaphore = (
+            threading.Semaphore(self.gpu_stage_concurrency)
+            if self.device.type == "cuda"
+            else None
+        )
+        self.reference_cache_size = max(0, int(reference_cache_size or 0))
+        self._reference_cache: OrderedDict[tuple[Any, ...], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = OrderedDict()
+        self._reference_cache_lock = threading.Lock()
         self.t2s_vllm = None
         self._pytorch_t2s_lock = threading.Lock()
 
@@ -108,23 +194,43 @@ class ConfuciusTTS:
 
         self.normalizer = TextNormalizer()
 
+        auto_use_vllm = use_vllm is None
+        if vllm_model_dir is None:
+            vllm_model_dir = paths.get("t2s_vllm_dir", "./checkpoints/t2s-vllm")
+        use_vllm = self._resolve_use_vllm(use_vllm, vllm_model_dir)
+
         if use_vllm:
             # Start vLLM before any CUDA context is created so forked engine
             # processes inherit the custom Confucius model registration.
-            self._load_t2s_model(paths, move_to_device=False)
-            if vllm_model_dir is None:
-                vllm_model_dir = paths.get("t2s_vllm_dir", "./checkpoints/t2s-vllm")
-            from confuciustts.llm.vllm_runtime import Text2SemanticVLLM
+            try:
+                self._load_t2s_model(paths, move_to_device=False)
+                from confuciustts.llm.vllm_runtime import Text2SemanticVLLM
 
-            self.t2s_vllm = Text2SemanticVLLM(
-                self.t2s_model,
-                model_dir=vllm_model_dir,
-                gpu_memory_utilization=vllm_gpu_memory_utilization,
-                tensor_parallel_size=vllm_tensor_parallel_size,
-                dtype=vllm_dtype,
-                attention_backend=vllm_attention_backend,
-            )
-            self.t2s_model.to(self.device)
+                self.t2s_vllm = Text2SemanticVLLM(
+                    self.t2s_model,
+                    model_dir=vllm_model_dir,
+                    gpu_memory_utilization=vllm_gpu_memory_utilization,
+                    tensor_parallel_size=vllm_tensor_parallel_size,
+                    dtype=vllm_dtype,
+                    attention_backend=vllm_attention_backend,
+                    prefix_mode=vllm_prefix_mode,
+                    latent_mode=vllm_latent_mode,
+                    hidden_states_dir=vllm_hidden_states_dir,
+                )
+                if self.t2s_vllm.requires_torch_model_on_device:
+                    self.t2s_model.to(self.device)
+            except Exception:
+                if not auto_use_vllm:
+                    raise
+                traceback.print_exc()
+                print(
+                    "[ConfuciusTTS] Default vLLM T2S fast path failed to start; "
+                    "falling back to the PyTorch T2S backend. Use --use-vllm "
+                    "to require vLLM and fail instead.",
+                    flush=True,
+                )
+                self.t2s_vllm = None
+                use_vllm = False
 
         self.feature_extractor = SeamlessM4TFeatureExtractor.from_pretrained(paths["w2v_bert_path"])
         self.w2v_model = Wav2Vec2BertModel.from_pretrained(paths["w2v_bert_path"]).eval().to(self.device)
@@ -144,8 +250,12 @@ class ConfuciusTTS:
         self.style_encoder.eval().to(self.device)
 
         if not use_vllm:
-            self._load_t2s_model(paths, move_to_device=True)
+            if getattr(self, "t2s_model", None) is None:
+                self._load_t2s_model(paths, move_to_device=True)
+            else:
+                self.t2s_model.to(self.device)
 
+        self.s2a_dtype = self._resolve_s2a_dtype(self._s2a_dtype_name)
         s2a_config = MaskedDiffWithXvecConfig(**self.cfg["s2a_model"])
         self.s2a_model = MaskedDiffWithXvec(s2a_config)
         s2a_model_path = hf_hub_download(
@@ -154,7 +264,8 @@ class ConfuciusTTS:
         self.s2a_model.load_state_dict(
             torch.load(s2a_model_path, map_location="cpu", weights_only=False)
         )
-        self.s2a_model.eval().to(self.device)
+        self.s2a_model.eval().to(device=self.device, dtype=self.s2a_dtype)
+        self.s2a_model.set_sdpa_backend(self.s2a_sdpa_backend)
         for param in self.s2a_model.parameters():
             param.requires_grad = False
         if self.compile_s2a:
@@ -166,6 +277,22 @@ class ConfuciusTTS:
         self.bigvgan.eval().to(self.device)
         for param in self.bigvgan.parameters():
             param.requires_grad = False
+
+    def _resolve_use_vllm(self, requested: Optional[bool], model_dir: str) -> bool:
+        if requested is not None:
+            return bool(requested)
+        if self.device.type != "cuda":
+            return False
+        if Path(model_dir).exists():
+            return True
+        print(
+            "[ConfuciusTTS] Optimized vLLM T2S is enabled by default, but the "
+            f"converted model directory was not found: {model_dir}. Falling back "
+            "to the PyTorch T2S backend. Run tools/convert_t2s_vllm.py to enable "
+            "the default fast path.",
+            flush=True,
+        )
+        return False
 
     def _load_t2s_model(self, paths: dict[str, Any], move_to_device: bool) -> None:
         self.tokenizer = AutoTokenizer.from_pretrained(paths["tokenizer_path"])
@@ -187,6 +314,84 @@ class ConfuciusTTS:
         if self.device.type == "cuda" and torch.cuda.is_available():
             torch.cuda.synchronize(self.device)
 
+    def _gpu_stage(self) -> _SemaphoreGuard:
+        return _SemaphoreGuard(self._gpu_stage_semaphore)
+
+    def _hash_file(self, path: str) -> tuple[str, int]:
+        resolved = Path(path).resolve()
+        stat = resolved.stat()
+        digest = hashlib.sha1()
+        with open(resolved, "rb") as file:
+            for chunk in iter(lambda: file.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest(), int(stat.st_size)
+
+    def _reference_cache_key(self, prompt_wav: str) -> tuple[Any, ...]:
+        digest, size = self._hash_file(prompt_wav)
+        return (
+            digest,
+            size,
+            self.sample_rate,
+            self.n_mels,
+            self.n_fft,
+            self.hop_length,
+            self.win_length,
+            self.fmin,
+            self.fmax,
+            str(self.device),
+        )
+
+    def _get_cached_reference(
+        self,
+        key: tuple[Any, ...],
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        if self.reference_cache_size <= 0:
+            return None
+        with self._reference_cache_lock:
+            cached = self._reference_cache.get(key)
+            if cached is None:
+                return None
+            self._reference_cache.move_to_end(key)
+            return cached
+
+    def _store_cached_reference(
+        self,
+        key: tuple[Any, ...],
+        value: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> None:
+        if self.reference_cache_size <= 0:
+            return
+        with self._reference_cache_lock:
+            self._reference_cache[key] = value
+            self._reference_cache.move_to_end(key)
+            while len(self._reference_cache) > self.reference_cache_size:
+                self._reference_cache.popitem(last=False)
+
+    def _reference_conditioning(
+        self,
+        prompt_wav: str,
+        timings: Optional[OrderedDict[str, float]],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        with _StepTimer(self, timings, "reference_cache_lookup"):
+            cache_key = self._reference_cache_key(prompt_wav)
+            cached = self._get_cached_reference(cache_key)
+        if cached is not None:
+            return cached
+
+        with _StepTimer(self, timings, "load_prompt"):
+            wav_16k, wav_tgt = self._load_prompt(prompt_wav)
+        with self._gpu_stage():
+            with _StepTimer(self, timings, "extract_semantic"):
+                semantic_features = self._extract_semantic(wav_16k)
+            with _StepTimer(self, timings, "extract_style"):
+                style_embedding = self._extract_style(wav_16k)
+            with _StepTimer(self, timings, "reference_mel"):
+                reference_mel = self._ref_mel(wav_tgt)
+
+        value = (semantic_features, style_embedding, reference_mel)
+        self._store_cached_reference(cache_key, value)
+        return value
+
     def _resolve_bigvgan_cuda_kernel(self, requested: Optional[bool]) -> bool:
         if self.device.type != "cuda":
             if requested:
@@ -207,6 +412,61 @@ class ConfuciusTTS:
                 raise RuntimeError("S2A torch.compile is only enabled for CUDA inference.")
             return False
         return True
+
+    def _resolve_s2a_dtype(self, requested: str) -> torch.dtype:
+        normalized = (requested or "auto").strip().lower()
+        aliases = {
+            "fp32": "float32",
+            "float": "float32",
+            "bf16": "bfloat16",
+            "fp16": "float16",
+            "half": "float16",
+        }
+        normalized = aliases.get(normalized, normalized)
+        if normalized == "auto":
+            if self.device.type == "cuda":
+                try:
+                    if torch.cuda.is_bf16_supported():
+                        return torch.bfloat16
+                except Exception:
+                    pass
+            return torch.float32
+        dtype_map = {
+            "float32": torch.float32,
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+        }
+        if normalized not in dtype_map:
+            raise ValueError("S2A dtype must be one of: auto, float32, bfloat16, float16.")
+        if self.device.type != "cuda" and dtype_map[normalized] is not torch.float32:
+            raise RuntimeError("S2A reduced precision dtypes are only supported for CUDA inference.")
+        return dtype_map[normalized]
+
+    def _resolve_s2a_sdpa_backend(self, requested: str) -> str:
+        normalized = (requested or "auto").strip().lower()
+        aliases = {
+            "auto": "auto",
+            "flash": "flash",
+            "flash_attention": "flash",
+            "flash-attention": "flash",
+            "efficient": "efficient",
+            "mem_efficient": "efficient",
+            "memory_efficient": "efficient",
+            "math": "math",
+            "cudnn": "cudnn",
+        }
+        if normalized not in aliases:
+            raise ValueError(
+                "S2A SDPA backend must be one of: auto, flash, efficient, math, cudnn."
+            )
+        return aliases[normalized]
+
+    def _next_profile_path(self, name: str) -> Path:
+        self._profile_counter += 1
+        self.profile_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in name)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        return self.profile_dir / f"{stamp}-{self._profile_counter:04d}-{safe_name}.json"
 
     def _preload_bigvgan_cuda_kernel(self) -> None:
         if not self.use_cuda_kernel:
@@ -486,6 +746,8 @@ class ConfuciusTTS:
         }
         if backend_name == "pytorch":
             with self._pytorch_t2s_lock:
+                if next(t2s_backend.parameters()).device != self.device:
+                    t2s_backend.to(self.device)
                 return t2s_backend.generate(**kwargs), backend_name
         return t2s_backend.generate(**kwargs), backend_name
 
@@ -609,6 +871,7 @@ class ConfuciusTTS:
         target_lengths = torch.tensor([target_length], device=self.device)
 
         semantic_emb = self.s2a_model.input_embedding(semantic_codes).transpose(1, 2)
+        lm_latent = lm_latent.to(device=self.device, dtype=semantic_emb.dtype)
         combined_features = torch.cat([lm_latent, semantic_emb], dim=-1)
         text_cond = self.s2a_model.encoder_proj(combined_features)
         cond_target, _ = self.s2a_model.length_regulator(text_cond, target_lengths)
@@ -639,6 +902,7 @@ class ConfuciusTTS:
             return [], 0
 
         max_total_length = max(total_length for _, _, total_length, _, _ in prepared_conditions)
+        min_total_length = min(total_length for _, _, total_length, _, _ in prepared_conditions)
         condition_dim = prepared_conditions[0][0].shape[-1]
         batch_size = len(prepared_conditions)
         cat_condition = torch.zeros(
@@ -667,26 +931,36 @@ class ConfuciusTTS:
 
         total_lengths_tensor = torch.tensor(total_lengths, device=self.device, dtype=torch.long)
         prompt_length = reference_mel.size(1)
-        prompt_batch = reference_mel.transpose(1, 2).expand(batch_size, -1, -1).contiguous()
-        style_batch = style_embedding.expand(batch_size, -1).contiguous()
+        prompt_batch = (
+            reference_mel.transpose(1, 2)
+            .to(device=self.device, dtype=cat_condition.dtype)
+            .expand(batch_size, -1, -1)
+            .contiguous()
+        )
+        style_batch = style_embedding.to(device=self.device, dtype=cat_condition.dtype).expand(batch_size, -1).contiguous()
+        skip_padding_mask = min_total_length == max_total_length
 
-        with _StepTimer(self, timings, "s2a"):
-            mel = self.s2a_model.decoder.forward(
-                mu=cat_condition,
-                x_lens=total_lengths_tensor,
-                prompt=prompt_batch,
-                spks=style_batch,
-                n_timesteps=n_timesteps,
-                inference_cfg_rate=inference_cfg_rate,
-                temperature=1.0,
-            )
-            mel = mel[:, :, prompt_length:]
-            for index, target_length in enumerate(target_lengths):
-                if target_length < mel.shape[-1]:
-                    mel[index, :, target_length:] = 0
+        with self._gpu_stage():
+            with _StepTimer(self, timings, "s2a"):
+                with _CudaProfiler(self, "s2a"):
+                    mel = self.s2a_model.decoder.forward(
+                        mu=cat_condition,
+                        x_lens=total_lengths_tensor,
+                        prompt=prompt_batch,
+                        spks=style_batch,
+                        n_timesteps=n_timesteps,
+                        inference_cfg_rate=inference_cfg_rate,
+                        temperature=1.0,
+                        skip_padding_mask=skip_padding_mask,
+                    )
+                mel = mel[:, :, prompt_length:]
+                for index, target_length in enumerate(target_lengths):
+                    if target_length < mel.shape[-1]:
+                        mel[index, :, target_length:] = 0
 
-        with _StepTimer(self, timings, "vocoder"):
-            audio_batch = self.bigvgan(mel.float().to(self.device)).squeeze(1)
+            with _StepTimer(self, timings, "vocoder"):
+                with _CudaProfiler(self, "vocoder"):
+                    audio_batch = self.bigvgan(mel.float().to(self.device)).squeeze(1)
 
         samples_per_frame = audio_batch.shape[-1] / mel.shape[-1]
         chunks = []
@@ -708,6 +982,67 @@ class ConfuciusTTS:
             chunks.append(chunk)
         return chunks, semantic_token_total
 
+    def _iter_s2a_length_buckets(
+        self,
+        prepared_conditions: list[tuple[torch.Tensor, int, int, int, Optional[int]]],
+    ):
+        if self.s2a_length_bucket_size <= 0 or len(prepared_conditions) <= 1:
+            yield list(range(len(prepared_conditions))), prepared_conditions
+            return
+
+        buckets: dict[int, list[tuple[int, tuple[torch.Tensor, int, int, int, Optional[int]]]]] = {}
+        bucket_size = self.s2a_length_bucket_size
+        for index, prepared in enumerate(prepared_conditions):
+            total_length = prepared[2]
+            bucket = ((total_length + bucket_size - 1) // bucket_size) * bucket_size
+            buckets.setdefault(bucket, []).append((index, prepared))
+
+        for entries in sorted(buckets.values(), key=lambda item: min(index for index, _ in item)):
+            indices = [index for index, _ in entries]
+            bucket_conditions = [prepared for _, prepared in entries]
+            yield indices, bucket_conditions
+
+    @torch.no_grad()
+    def _decode_s2a_condition_batches(
+        self,
+        prepared_conditions: list[tuple[torch.Tensor, int, int, int, Optional[int]]],
+        reference_mel: torch.Tensor,
+        style_embedding: torch.Tensor,
+        n_timesteps: int,
+        inference_cfg_rate: float,
+        timings: Optional[OrderedDict[str, float]] = None,
+    ) -> tuple[list[torch.Tensor], int]:
+        if not prepared_conditions:
+            return [], 0
+        if self.s2a_length_bucket_size <= 0 or len(prepared_conditions) <= 1:
+            return self._decode_s2a_condition_batch(
+                prepared_conditions=prepared_conditions,
+                reference_mel=reference_mel,
+                style_embedding=style_embedding,
+                n_timesteps=n_timesteps,
+                inference_cfg_rate=inference_cfg_rate,
+                timings=timings,
+            )
+
+        chunks: list[Optional[torch.Tensor]] = [None] * len(prepared_conditions)
+        semantic_token_total = 0
+        for indices, bucket_conditions in self._iter_s2a_length_buckets(prepared_conditions):
+            bucket_chunks, bucket_semantic_tokens = self._decode_s2a_condition_batch(
+                prepared_conditions=bucket_conditions,
+                reference_mel=reference_mel,
+                style_embedding=style_embedding,
+                n_timesteps=n_timesteps,
+                inference_cfg_rate=inference_cfg_rate,
+                timings=timings,
+            )
+            for index, chunk in zip(indices, bucket_chunks):
+                chunks[index] = chunk
+            semantic_token_total += bucket_semantic_tokens
+
+        if any(chunk is None for chunk in chunks):
+            raise RuntimeError("S2A length bucketing failed to produce all chunks.")
+        return [chunk for chunk in chunks if chunk is not None], semantic_token_total
+
     @torch.no_grad()
     def _synth_audio_from_t2s(
         self,
@@ -726,7 +1061,7 @@ class ConfuciusTTS:
             verbose=verbose,
             target_duration_seconds=target_duration_seconds,
         )
-        chunks, semantic_token_total = self._decode_s2a_condition_batch(
+        chunks, semantic_token_total = self._decode_s2a_condition_batches(
             prepared_conditions=[prepared],
             reference_mel=reference_mel,
             style_embedding=style_embedding,
@@ -881,7 +1216,7 @@ class ConfuciusTTS:
                         )
                         for offset, t2s_out in enumerate(batch_outputs)
                     ]
-                batch_chunks, batch_semantic_tokens = self._decode_s2a_condition_batch(
+                batch_chunks, batch_semantic_tokens = self._decode_s2a_condition_batches(
                     prepared_conditions=prepared_conditions,
                     reference_mel=reference_mel,
                     style_embedding=style_embedding,
@@ -982,15 +1317,11 @@ class ConfuciusTTS:
         if verbose:
             print(f"[ConfuciusTTS] normalized text: {text}")
 
-        # Extract conditioning from reference audio
-        with _StepTimer(self, timings, "load_prompt"):
-            wav_16k, wav_tgt = self._load_prompt(prompt_wav)
-        with _StepTimer(self, timings, "extract_semantic"):
-            semantic_features = self._extract_semantic(wav_16k)
-        with _StepTimer(self, timings, "extract_style"):
-            style_embedding = self._extract_style(wav_16k)
-        with _StepTimer(self, timings, "reference_mel"):
-            reference_mel = self._ref_mel(wav_tgt)
+        # Extract or reuse reference conditioning.
+        semantic_features, style_embedding, reference_mel = self._reference_conditioning(
+            prompt_wav,
+            timings,
+        )
 
         # Split long text into segments
         with _StepTimer(self, timings, "segment_text"):
@@ -1114,15 +1445,24 @@ def main():
     parser.add_argument("--config", type=str, default="config/inference_config.yaml")
     parser.add_argument("--t2s_checkpoint", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--use_vllm", action="store_true",
-                        help="Use vLLM for the autoregressive T2S semantic decoder.")
+    parser.add_argument("--use_vllm", "--use-vllm",
+                        action=argparse.BooleanOptionalAction, default=None,
+                        help="Use vLLM for the autoregressive T2S semantic decoder. Defaults to auto on CUDA when the converted model exists.")
     parser.add_argument("--vllm_model_dir", type=str, default=None,
                         help="Converted T2S vLLM directory from tools/convert_t2s_vllm.py.")
     parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.25)
     parser.add_argument("--vllm_tensor_parallel_size", type=int, default=1)
-    parser.add_argument("--vllm_dtype", type=str, default="float32")
+    parser.add_argument("--vllm_dtype", type=str, default="auto")
     parser.add_argument("--vllm_attention_backend", type=str, default=None,
                         help="Optional vLLM attention backend override, e.g. FLASHINFER or FLASH_ATTN.")
+    parser.add_argument("--vllm_prefix_mode", "--vllm-prefix-mode", default="auto",
+                        choices=["auto", "embeds", "worker"],
+                        help="How vLLM receives the T2S prefix. worker requires a freshly converted vLLM model.")
+    parser.add_argument("--vllm_latent_mode", "--vllm-latent-mode", default="auto",
+                        choices=["auto", "vllm", "pytorch"],
+                        help="How vLLM mode obtains T2S latents for S2A.")
+    parser.add_argument("--vllm_hidden_states_dir", "--vllm-hidden-states-dir", default=None,
+                        help="Directory for temporary vLLM hidden-state extraction files.")
     parser.add_argument("--cross_fade_duration", type=float, default=0.3)
     parser.add_argument("--edge_fade_duration", type=float, default=0.1)
     parser.add_argument("--edge_pad_duration", type=float, default=0.1)
@@ -1138,6 +1478,23 @@ def main():
     parser.add_argument("--use_bigvgan_cuda_kernel", "--use-bigvgan-cuda-kernel",
                         action=argparse.BooleanOptionalAction, default=None,
                         help="Use BigVGAN's fused CUDA activation kernel. Defaults to enabled on CUDA.")
+    parser.add_argument("--s2a_dtype", "--s2a-dtype", default="auto",
+                        choices=["auto", "float32", "bfloat16", "float16", "bf16", "fp16", "fp32"],
+                        help="S2A inference dtype.")
+    parser.add_argument("--s2a_sdpa_backend", "--s2a-sdpa-backend", default="auto",
+                        choices=["auto", "flash", "efficient", "math", "cudnn"],
+                        help="Optional PyTorch SDPA backend override for S2A DiT attention.")
+    parser.add_argument("--s2a_length_bucket_size", "--s2a-length-bucket-size", type=int, default=64,
+                        help="Bucket multi-segment S2A batches by total mel length. 0 disables bucketing.")
+    parser.add_argument("--profile_cuda", "--profile-cuda", action=argparse.BooleanOptionalAction,
+                        default=False, dest="profile_cuda",
+                        help="Write torch profiler traces for S2A and BigVGAN stages.")
+    parser.add_argument("--profile_dir", "--profile-dir", default="outputs/profiles",
+                        help="Directory for CUDA profiler traces.")
+    parser.add_argument("--gpu_stage_concurrency", "--gpu-stage-concurrency", type=int, default=1,
+                        help="Maximum concurrent non-vLLM GPU stages per process.")
+    parser.add_argument("--reference_cache_size", "--reference-cache-size", type=int, default=16,
+                        help="Number of reference-audio conditioning entries to cache per process.")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -1151,8 +1508,18 @@ def main():
         vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
         vllm_dtype=args.vllm_dtype,
         vllm_attention_backend=args.vllm_attention_backend,
+        vllm_prefix_mode=args.vllm_prefix_mode,
+        vllm_latent_mode=args.vllm_latent_mode,
+        vllm_hidden_states_dir=args.vllm_hidden_states_dir,
         compile_s2a=args.compile_s2a,
         use_cuda_kernel=args.use_bigvgan_cuda_kernel,
+        s2a_dtype=args.s2a_dtype,
+        s2a_sdpa_backend=args.s2a_sdpa_backend,
+        s2a_length_bucket_size=args.s2a_length_bucket_size,
+        profile_cuda=args.profile_cuda,
+        profile_dir=args.profile_dir,
+        gpu_stage_concurrency=args.gpu_stage_concurrency,
+        reference_cache_size=args.reference_cache_size,
     )
     audio = model.generate(
         args.text, args.lang, args.prompt_wav,

@@ -59,6 +59,13 @@ from vllm.multimodal.processing.processor import (
 )
 from vllm.sequence import IntermediateTensors
 
+from confuciustts.llm.position_embeddings import LearnedPositionalEmbedding
+from confuciustts.llm.speaker_encoder import (
+    Qwen3TTSSpeakerEncoder,
+    Qwen3TTSSpeakerEncoderConfig,
+)
+from confuciustts.llm.text_encoder import TextEmbeddingProjector
+
 
 PLACEHOLDER_TOKEN = "!"
 PLACEHOLDER_TOKEN_ID = 8192
@@ -66,6 +73,12 @@ PLACEHOLDER_TOKEN_ID = 8192
 
 def _placeholder_token_id_from_config(config: object) -> int:
     return int(getattr(config, "start_semantic_token", PLACEHOLDER_TOKEN_ID))
+
+
+def _config_get(config: Any, key: str, default: Any) -> Any:
+    if isinstance(config, dict):
+        return config.get(key, default)
+    return getattr(config, key, default)
 
 
 class ConfuciusTTSProcessingInfo(BaseProcessingInfo):
@@ -107,6 +120,25 @@ class ConfuciusTTSDataParser(MultiModalDataParser):
         data: ModalityData[AudioItem],
     ) -> Optional[ModalityDataItems[Any, Any]]:
         if isinstance(data, dict):
+            if "audio_embeds" in data:
+                return DictEmbeddingItems(
+                    data,
+                    modality="audio",
+                    required_fields={"audio_embeds"},
+                    fields_factory=lambda hf_inputs: dict(
+                        audio_embeds=MultiModalFieldConfig.batched("audio")
+                    ),
+                )
+            if "text_inputs" in data and "condition_vector" in data:
+                return DictEmbeddingItems(
+                    data,
+                    modality="audio",
+                    required_fields={"text_inputs", "condition_vector"},
+                    fields_factory=lambda hf_inputs: dict(
+                        text_inputs=MultiModalFieldConfig.batched("audio"),
+                        condition_vector=MultiModalFieldConfig.batched("audio"),
+                    ),
+                )
             return DictEmbeddingItems(
                 data,
                 modality="audio",
@@ -149,7 +181,11 @@ class ConfuciusTTSMultiModalProcessor(
         hf_inputs: BatchFeature,
         hf_processor_mm_kwargs: Mapping[str, object],
     ) -> Mapping[str, MultiModalFieldConfig]:
-        return dict(audio_embeds=MultiModalFieldConfig.batched("audio"))
+        return dict(
+            audio_embeds=MultiModalFieldConfig.batched("audio"),
+            text_inputs=MultiModalFieldConfig.batched("audio"),
+            condition_vector=MultiModalFieldConfig.batched("audio"),
+        )
 
     def _get_prompt_updates(
         self,
@@ -161,9 +197,14 @@ class ConfuciusTTSMultiModalProcessor(
         placeholder_token_id = self._placeholder_token_id()
 
         def get_replacement(item_idx: int) -> PromptUpdateDetails:
-            embeds = out_mm_data["audio_embeds"][item_idx]
+            if "audio_embeds" in out_mm_data:
+                embeds = out_mm_data["audio_embeds"][item_idx]
+                replacement_len = embeds.shape[0]
+            else:
+                text_inputs = out_mm_data["text_inputs"][item_idx]
+                replacement_len = int(text_inputs.numel()) + 2
             return PromptUpdateDetails.select_token_id(
-                [placeholder_token_id] * embeds.shape[0],
+                [placeholder_token_id] * replacement_len,
                 placeholder_token_id,
             )
 
@@ -280,9 +321,52 @@ class ConfuciusText2SemanticForCausalLM(nn.Module, SupportsPP, SupportsMultiModa
         super().__init__()
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
+        t2s_config = getattr(config, "text2semantic_config", {}) or {}
+        text_embedding_dim = int(
+            _config_get(
+                t2s_config,
+                "text_embedding_dim",
+                getattr(config, "text_embedding_dim", 4096),
+            )
+        )
+        speaker_embedding_dim = int(
+            _config_get(
+                t2s_config,
+                "speaker_embedding_dim",
+                getattr(config, "speaker_embedding_dim", 1024),
+            )
+        )
 
         self.config = config
         self.quant_config = quant_config
+        self.supports_worker_prefix = bool(
+            getattr(config, "confucius_supports_worker_prefix", False)
+        )
+        if self.supports_worker_prefix:
+            self.text_projector = TextEmbeddingProjector(
+                vocab_size=int(
+                    getattr(
+                        config,
+                        "text_vocab_size",
+                        _config_get(t2s_config, "vocab_size", 32000),
+                    )
+                ),
+                embed_dim=text_embedding_dim,
+                output_size=config.n_embd,
+            )
+            self.text_position_embedding = LearnedPositionalEmbedding(
+                getattr(config, "max_text_seq_lens", 520),
+                config.n_embd,
+            )
+            speaker_config = Qwen3TTSSpeakerEncoderConfig(
+                mel_dim=speaker_embedding_dim,
+                enc_dim=config.n_embd,
+            )
+            self.speaker_encoder = Qwen3TTSSpeakerEncoder(speaker_config)
+        else:
+            self.text_projector = None
+            self.text_position_embedding = None
+            self.speaker_encoder = None
         self.transformer = ConfuciusGPT2Model(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "transformer"),
@@ -321,20 +405,71 @@ class ConfuciusText2SemanticForCausalLM(nn.Module, SupportsPP, SupportsMultiModa
 
     def embed_multimodal(self, **kwargs: object) -> Optional[MultiModalEmbeddings]:
         audio_embeds = kwargs.get("audio_embeds")
-        if audio_embeds is None:
+        if audio_embeds is not None:
+            processed_embeds = []
+            for embed in audio_embeds:
+                if embed.dim() == 3 and embed.shape[0] == 1:
+                    processed_embeds.append(embed.squeeze(0))
+                elif embed.dim() == 2:
+                    processed_embeds.append(embed)
+                else:
+                    raise ValueError(
+                        "Expected Confucius prefix embeddings to be 2D or 3D with "
+                        f"a leading batch dimension of 1, got shape {tuple(embed.shape)}"
+                    )
+            return processed_embeds
+
+        text_inputs = kwargs.get("text_inputs")
+        condition_vectors = kwargs.get("condition_vector")
+        if text_inputs is None and condition_vectors is None:
             return None
+        if text_inputs is None or condition_vectors is None:
+            raise ValueError(
+                "Confucius worker-side prefix construction requires both "
+                "text_inputs and condition_vector."
+            )
+        if not self.supports_worker_prefix:
+            raise RuntimeError(
+                "This converted Confucius vLLM model does not contain worker-side "
+                "prefix weights. Re-run tools/convert_t2s_vllm.py."
+            )
 
         processed_embeds = []
-        for embed in audio_embeds:
-            if embed.dim() == 3 and embed.shape[0] == 1:
-                processed_embeds.append(embed.squeeze(0))
-            elif embed.dim() == 2:
-                processed_embeds.append(embed)
-            else:
+        for text_item, condition_item in zip(text_inputs, condition_vectors):
+            if text_item.dim() == 1:
+                text_item = text_item.unsqueeze(0)
+            if condition_item.dim() == 2:
+                condition_item = condition_item.unsqueeze(0)
+            if text_item.dim() != 2 or text_item.shape[0] != 1:
                 raise ValueError(
-                    "Expected Confucius prefix embeddings to be 2D or 3D with "
-                    f"a leading batch dimension of 1, got shape {tuple(embed.shape)}"
+                    "Expected text_inputs to be 1D token IDs or shape (1, T), "
+                    f"got {tuple(text_item.shape)}"
                 )
+            if condition_item.dim() != 3 or condition_item.shape[0] != 1:
+                raise ValueError(
+                    "Expected condition_vector to be shape (T, D) or (1, T, D), "
+                    f"got {tuple(condition_item.shape)}"
+                )
+            embed_device = self.final_norm.weight.device
+            embed_dtype = self.final_norm.weight.dtype
+            text_item = text_item.to(device=embed_device, dtype=torch.long)
+            condition_item = condition_item.to(
+                device=embed_device,
+                dtype=embed_dtype,
+            )
+            condition_emb = self.speaker_encoder(condition_item).unsqueeze(1)
+            text_emb = self.text_projector(text_item)
+            text_emb = self.text_position_embedding(text_emb)
+            bos = torch.full(
+                (1, 1),
+                _placeholder_token_id_from_config(self.config),
+                dtype=torch.long,
+                device=text_item.device,
+            )
+            bos_emb = self.semantic_embedding(bos)
+            processed_embeds.append(
+                torch.cat([condition_emb, text_emb, bos_emb], dim=1).squeeze(0)
+            )
         return processed_embeds
 
     def embed_input_ids(
@@ -397,9 +532,10 @@ class ConfuciusText2SemanticForCausalLM(nn.Module, SupportsPP, SupportsMultiModa
         )
         if isinstance(transformer_output, IntermediateTensors):
             return transformer_output
-        return self.final_norm(transformer_output)
+        return transformer_output
 
     def compute_logits(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
+        hidden_states = self.final_norm(hidden_states)
         return self.logits_processor(
             self.semantic_head,
             hidden_states,

@@ -154,6 +154,10 @@ class MaskedDiffWithXvec(nn.Module):
         )
         self.torch_compile_enabled = True
 
+    def set_sdpa_backend(self, backend: str | None) -> None:
+        """Select the PyTorch SDPA backend used by the S2A DiT estimator."""
+        self.decoder.set_sdpa_backend(backend)
+
     def forward(self, batch: Dict[str, torch.Tensor], device: Optional[torch.device] = None) -> Dict[str, torch.Tensor]:
         """Training forward pass with prompt conditioning.
 
@@ -264,6 +268,7 @@ class MaskedDiffWithXvec(nn.Module):
             n_timesteps=n_timesteps,
             inference_cfg_rate=inference_cfg_rate,
             temperature=1.0,
+            skip_padding_mask=batch_size == 1,
         )
 
         # Remove prompt portion

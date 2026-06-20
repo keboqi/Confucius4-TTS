@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -119,6 +121,61 @@ class ConditionalCFM(nn.Module):
             wavenet_dropout=wavenet_dropout,
         )
         self.torch_compile_enabled = False
+        self.sdpa_backend = "auto"
+
+    def set_sdpa_backend(self, backend: str | None) -> None:
+        """Select the PyTorch SDPA backend used inside the DiT estimator."""
+        normalized = (backend or "auto").strip().lower()
+        aliases = {
+            "auto": "auto",
+            "flash": "flash",
+            "flash_attention": "flash",
+            "flash-attention": "flash",
+            "efficient": "efficient",
+            "mem_efficient": "efficient",
+            "memory_efficient": "efficient",
+            "math": "math",
+            "cudnn": "cudnn",
+        }
+        if normalized not in aliases:
+            raise ValueError(
+                "S2A SDPA backend must be one of: auto, flash, efficient, math, cudnn."
+            )
+        self.sdpa_backend = aliases[normalized]
+
+    def _sdpa_context(self):
+        if self.sdpa_backend == "auto":
+            return nullcontext()
+        try:
+            from torch.nn.attention import SDPBackend, sdpa_kernel
+        except Exception as exc:
+            raise RuntimeError(
+                "This PyTorch build does not expose torch.nn.attention.sdpa_kernel."
+            ) from exc
+        backend_map = {
+            "flash": "FLASH_ATTENTION",
+            "efficient": "EFFICIENT_ATTENTION",
+            "math": "MATH",
+            "cudnn": "CUDNN_ATTENTION",
+        }
+        attr = backend_map[self.sdpa_backend]
+        if not hasattr(SDPBackend, attr):
+            raise RuntimeError(
+                f"This PyTorch build does not expose SDPBackend.{attr}."
+            )
+        return sdpa_kernel(getattr(SDPBackend, attr))
+
+    def _call_estimator(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor | None,
+        mu: torch.Tensor,
+        t: torch.Tensor,
+        spks: torch.Tensor,
+        prompt: torch.Tensor,
+    ) -> torch.Tensor:
+        with self._sdpa_context():
+            return self.estimator(x, mask, mu, t, spks, prompt)
 
     def enable_torch_compile(
         self,
@@ -173,13 +230,23 @@ class ConditionalCFM(nn.Module):
             spks = spks * cfg_mask.view(-1, 1)
             prompt = prompt * cfg_mask.view(-1, 1, 1)
 
-        pred = self.estimator(y, mask.squeeze(1), mu, t_rand.squeeze(), spks, prompt)
+        pred = self._call_estimator(y, mask.squeeze(1), mu, t_rand.squeeze(), spks, prompt)
 
         loss = F.l1_loss(pred * loss_mask, u * loss_mask, reduction="sum") / loss_mask.sum()
         return loss, y
 
     @torch.no_grad()
-    def forward(self, mu: torch.Tensor, x_lens: torch.Tensor, prompt: torch.Tensor,spks: torch.Tensor, n_timesteps: int = 25, inference_cfg_rate: float = 0.7, temperature: float = 1.0):
+    def forward(
+        self,
+        mu: torch.Tensor,
+        x_lens: torch.Tensor,
+        prompt: torch.Tensor,
+        spks: torch.Tensor,
+        n_timesteps: int = 25,
+        inference_cfg_rate: float = 0.7,
+        temperature: float = 1.0,
+        skip_padding_mask: bool = False,
+    ):
         b, t = mu.size(0), mu.size(1)
         z = torch.randn(b, self.mel_dim, t, device=mu.device, dtype=mu.dtype) * temperature
 
@@ -189,9 +256,18 @@ class ConditionalCFM(nn.Module):
 
         cfg_rate = inference_cfg_rate if inference_cfg_rate is not None else self.inference_cfg_rate
 
-        return self.solve_euler(z, t_span=t_span, x_lens=x_lens, prompt=prompt, mu=mu, spks=spks, cfg_rate=cfg_rate)
+        return self.solve_euler(
+            z,
+            t_span=t_span,
+            x_lens=x_lens,
+            prompt=prompt,
+            mu=mu,
+            spks=spks,
+            cfg_rate=cfg_rate,
+            skip_padding_mask=skip_padding_mask,
+        )
 
-    def solve_euler(self, x, t_span, x_lens, prompt, mu, spks, cfg_rate):
+    def solve_euler(self, x, t_span, x_lens, prompt, mu, spks, cfg_rate, skip_padding_mask: bool = False):
         t, _, dt = t_span[0], t_span[1], t_span[1] - t_span[0]
 
         prompt_len = prompt.size(-1)
@@ -199,10 +275,12 @@ class ConditionalCFM(nn.Module):
         prompt_x[..., :prompt_len] = prompt[..., :prompt_len]
         x[..., :prompt_len] = 0
 
-        # Create mask from x_lens
         batch_size = x.size(0)
         max_len = x.size(2)
-        mask = torch.arange(max_len, device=x.device).unsqueeze(0) < x_lens.unsqueeze(1)
+        if skip_padding_mask:
+            mask = None
+        else:
+            mask = torch.arange(max_len, device=x.device).unsqueeze(0) < x_lens.unsqueeze(1)
 
         # Do not use concat, it may cause memory format changed and trt infer with wrong results!
         # NOTE when flow run in amp mode, x.dtype is float32, which cause nan in trt fp16 inference, so set dtype=spks.dtype
@@ -211,7 +289,11 @@ class ConditionalCFM(nn.Module):
         mu_in = torch.zeros([2 * batch_size, mu.size(1), mu.size(2)], device=x.device, dtype=spks.dtype)
         t_in = torch.zeros([2 * batch_size], device=x.device, dtype=spks.dtype)
         spks_in = torch.zeros([2 * batch_size, spks.size(1)], device=x.device, dtype=spks.dtype)
-        mask_in = torch.zeros([2 * batch_size, max_len], device=x.device, dtype=torch.bool)
+        mask_in = (
+            None
+            if mask is None
+            else torch.zeros([2 * batch_size, max_len], device=x.device, dtype=torch.bool)
+        )
 
         for step in range(1, len(t_span)):
             if cfg_rate > 0:
@@ -224,14 +306,15 @@ class ConditionalCFM(nn.Module):
                 t_in[:] = t
                 spks_in[:batch_size] = spks
                 spks_in[batch_size:] = 0
-                mask_in[:batch_size] = mask
-                mask_in[batch_size:] = mask
+                if mask_in is not None:
+                    mask_in[:batch_size] = mask
+                    mask_in[batch_size:] = mask
 
-                dphi_dt = self.estimator(x_in, mask_in, mu_in, t_in, spks_in, prompt_x_in)
+                dphi_dt = self._call_estimator(x_in, mask_in, mu_in, t_in, spks_in, prompt_x_in)
                 dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [batch_size, batch_size], dim=0)
                 dphi_dt = ((1.0 + cfg_rate) * dphi_dt - cfg_rate * cfg_dphi_dt)
             else:
-                dphi_dt = self.estimator(x, mask, mu, t, spks, prompt_x)
+                dphi_dt = self._call_estimator(x, mask, mu, t, spks, prompt_x)
 
             x = x + dt * dphi_dt
             t = t + dt

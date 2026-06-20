@@ -24,6 +24,9 @@ from confuciustts.llm.llm import Text2Semantic, Text2SemanticConfig
 
 
 VLLM_WEIGHT_PREFIXES = (
+    "text_projector.",
+    "text_position_embedding.",
+    "speaker_encoder.",
     "semantic_embedding.",
     "semantic_position_embedding.",
     "transformer.",
@@ -116,10 +119,14 @@ def main() -> None:
     hf_config.model_type = "gpt2"
     hf_config.max_text_seq_lens = model_cfg.max_text_seq_lens
     hf_config.max_semantic_seq_lens = model_cfg.max_semantic_seq_lens
+    hf_config.text_vocab_size = model_cfg.vocab_size
+    hf_config.text_embedding_dim = model_cfg.text_embedding_dim
+    hf_config.speaker_embedding_dim = model_cfg.speaker_embedding_dim
     hf_config.semantic_vocab_size = model_cfg.semantic_vocab_size
     hf_config.start_semantic_token = model_cfg.start_semantic_token
     hf_config.stop_semantic_token = model_cfg.stop_semantic_token
     hf_config.text2semantic_config = model_cfg.to_dict()
+    hf_config.confucius_supports_worker_prefix = True
 
     with open(output / "config.json", "w", encoding="utf-8") as file:
         json.dump(hf_config.to_dict(), file, indent=2, sort_keys=True)
