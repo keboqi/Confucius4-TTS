@@ -190,12 +190,71 @@ def _output_path(prompt_wav: str, backend: str) -> Path:
     return OUTPUT_DIR / f"confucius4tts-{backend}-{stamp}-{digest}.wav"
 
 
+def _mp3_preview_path(wav_output: Path) -> Path:
+    return wav_output.with_suffix(".mp3")
+
+
+def _save_mp3_preview(
+    wav_output: Path,
+    audio: torch.Tensor,
+    sample_rate: int,
+) -> Path:
+    mp3_output = _mp3_preview_path(wav_output)
+    try:
+        torchaudio.save(
+            str(mp3_output),
+            audio,
+            sample_rate,
+            format="mp3",
+        )
+        return mp3_output
+    except Exception as torchaudio_exc:
+        try:
+            process = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    str(wav_output),
+                    "-codec:a",
+                    "libmp3lame",
+                    "-q:a",
+                    "2",
+                    str(mp3_output),
+                ],
+                capture_output=True,
+                text=True,
+            )
+        except Exception as ffmpeg_exc:
+            raise gr.Error(
+                "Generated the WAV, but could not create an MP3 preview. "
+                "Install FFmpeg with MP3 support or use a torchaudio build with "
+                "FFmpeg encoding enabled. "
+                f"torchaudio error: {torchaudio_exc}. "
+                f"ffmpeg error: {ffmpeg_exc}"
+            ) from torchaudio_exc
+        if process.returncode == 0 and mp3_output.exists():
+            return mp3_output
+        raise gr.Error(
+            "Generated the WAV, but could not create an MP3 preview. "
+            "Install FFmpeg with MP3 support or use a torchaudio build with "
+            "FFmpeg encoding enabled. "
+            f"torchaudio error: {torchaudio_exc}. "
+            f"ffmpeg stderr: {process.stderr.strip() or '(empty)'}"
+        ) from torchaudio_exc
+
+
 def _format_timing_status(
     output: Path,
+    preview: Path,
     audio: torch.Tensor,
     sample_rate: int,
     timing_info: dict[str, Any],
     save_elapsed: float,
+    preview_elapsed: float,
     request_elapsed: float,
 ) -> str:
     generated_seconds = audio.shape[-1] / sample_rate
@@ -207,7 +266,10 @@ def _format_timing_status(
         (
             f"segments={timing_info['segments']}, "
             f"semantic_tokens={timing_info['semantic_tokens']}, "
-            f"saved={output}"
+            f"wav={output}"
+        ),
+        (
+            f"preview_mp3={preview}"
         ),
         "",
         "Timings:",
@@ -225,6 +287,7 @@ def _format_timing_status(
         lines.append(f"{name}: {seconds:.3f}s")
     lines.append(f"model_total: {timing_info['total']:.3f}s")
     lines.append(f"save_wav: {save_elapsed:.3f}s")
+    lines.append(f"save_mp3_preview: {preview_elapsed:.3f}s")
     lines.append(f"request_total: {request_elapsed:.3f}s")
     return "\n".join(lines)
 
@@ -360,6 +423,11 @@ def _synthesize_original_subprocess(
             "Original PyTorch generation finished without creating the output file."
         )
 
+    preview_started = time.perf_counter()
+    preview_audio, preview_sample_rate = torchaudio.load(str(output))
+    preview_output = _save_mp3_preview(output, preview_audio, preview_sample_rate)
+    preview_elapsed = time.perf_counter() - preview_started
+
     with wave.open(str(output), "rb") as wav_file:
         generated_seconds = wav_file.getnframes() / wav_file.getframerate()
     status_lines = [
@@ -367,14 +435,16 @@ def _synthesize_original_subprocess(
             f"Original PyTorch T2S generated {generated_seconds:.2f}s "
             f"of audio in {request_elapsed:.2f}s on {SERVE_DEVICE}."
         ),
-        f"saved={output}",
+        f"wav={output}",
+        f"preview_mp3={preview_output}",
+        f"save_mp3_preview={preview_elapsed:.3f}s",
         "",
         "Subprocess output:",
         process.stdout.strip() or "(no stdout)",
     ]
     if process.stderr.strip():
         status_lines.extend(["", "Subprocess stderr:", process.stderr.strip()])
-    return str(output), str(output), "\n".join(status_lines)
+    return str(preview_output), str(output), "\n".join(status_lines)
 
 
 def _synthesize(
@@ -461,16 +531,21 @@ def _synthesize(
     audio_cpu = audio.detach().float().cpu()
     torchaudio.save(str(output), audio_cpu, model.sample_rate)
     save_elapsed = time.perf_counter() - save_started
+    preview_started = time.perf_counter()
+    preview_output = _save_mp3_preview(output, audio_cpu, model.sample_rate)
+    preview_elapsed = time.perf_counter() - preview_started
 
     status = _format_timing_status(
         output=output,
+        preview=preview_output,
         audio=audio,
         sample_rate=model.sample_rate,
         timing_info=timing_info,
         save_elapsed=save_elapsed,
+        preview_elapsed=preview_elapsed,
         request_elapsed=time.perf_counter() - started,
     )
-    return str(output), str(output), status
+    return str(preview_output), str(output), status
 
 
 def synthesize_vllm(*args: Any) -> tuple[str, str, str]:
@@ -541,11 +616,11 @@ def build_demo() -> gr.Blocks:
 
         with gr.Row():
             with gr.Column():
-                vllm_audio = gr.Audio(label="vLLM audio", type="filepath")
+                vllm_audio = gr.Audio(label="vLLM MP3 preview", type="filepath")
                 vllm_file = gr.File(label="Download vLLM WAV")
                 vllm_status = gr.Textbox(label="vLLM timing", interactive=False, lines=14)
             with gr.Column():
-                original_audio = gr.Audio(label="Original audio", type="filepath")
+                original_audio = gr.Audio(label="Original MP3 preview", type="filepath")
                 original_file = gr.File(label="Download original WAV")
                 original_status = gr.Textbox(label="Original timing", interactive=False, lines=14)
 
