@@ -155,6 +155,9 @@ BigVGAN uses NVIDIA's fused CUDA activation kernel automatically on CUDA,
 matching the IndexTTS fast path. Use `--no-use-bigvgan-cuda-kernel` to disable
 it, or set `CONFUCIUS_USE_BIGVGAN_CUDA_KERNEL=0`. If the kernel cannot be built
 or loaded, Confucius falls back to the plain torch BigVGAN implementation.
+On RTX PRO 6000 / Blackwell, the vendored BigVGAN loader detects the active CUDA
+device and builds an architecture-specific extension such as `sm_120`, avoiding
+older hard-coded `compute_70` flags that recent CUDA toolchains reject.
 
 Duration targets are specified in seconds and the final waveform is fitted at
 sample precision, so millisecond-level dubbing targets are preserved. The

@@ -5,6 +5,7 @@ import os
 import pathlib
 import subprocess
 
+import torch
 from torch.utils import cpp_extension
 
 """
@@ -15,12 +16,7 @@ os.environ["TORCH_CUDA_ARCH_LIST"] = ""
 
 
 def load():
-    # Check if cuda 11 is installed for compute capability 8.0
-    cc_flag = []
-    _, bare_metal_major, _ = _get_cuda_bare_metal_version(cpp_extension.CUDA_HOME)
-    if int(bare_metal_major) >= 11:
-        cc_flag.append("-gencode")
-        cc_flag.append("arch=compute_80,code=sm_80")
+    arch_name, cc_flags = _get_cuda_arch_flags()
 
     # Build path
     srcpath = pathlib.Path(__file__).parent.absolute()
@@ -38,12 +34,10 @@ def load():
             ],
             extra_cuda_cflags=[
                 "-O3",
-                "-gencode",
-                "arch=compute_70,code=sm_70",
                 "--use_fast_math",
             ]
             + extra_cuda_flags
-            + cc_flag,
+            + cc_flags,
             verbose=True,
         )
 
@@ -59,10 +53,23 @@ def load():
         srcpath / "anti_alias_activation_cuda.cu",
     ]
     anti_alias_activation_cuda = _cpp_extention_load_helper(
-        "anti_alias_activation_cuda", sources, extra_cuda_flags
+        f"anti_alias_activation_cuda_{arch_name}", sources, extra_cuda_flags
     )
 
     return anti_alias_activation_cuda
+
+
+def _get_cuda_arch_flags():
+    if torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability()
+        arch = f"{major}{minor}"
+        print(f"Detected CUDA device capability sm_{arch} for BigVGAN kernel build")
+        return f"sm{arch}", ["-gencode", f"arch=compute_{arch},code=sm_{arch}"]
+
+    _, bare_metal_major, _ = _get_cuda_bare_metal_version(cpp_extension.CUDA_HOME)
+    if int(bare_metal_major) >= 11:
+        return "sm80", ["-gencode", "arch=compute_80,code=sm_80"]
+    return "sm70", ["-gencode", "arch=compute_70,code=sm_70"]
 
 
 def _get_cuda_bare_metal_version(cuda_dir):
