@@ -11,7 +11,7 @@ import uuid
 import warnings
 from importlib.metadata import entry_points
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 import torch
 
@@ -262,10 +262,27 @@ class Text2SemanticVLLM:
         latent = self._compute_latent(text_inputs, condition_vector, semantic_codes)
         return {"semantic_codes": semantic_codes, "latent": latent}
 
+    async def async_generate_many(
+        self,
+        requests: Sequence[Dict[str, Any]],
+    ) -> list[Any]:
+        if not requests:
+            return []
+        tasks = [
+            asyncio.create_task(self.async_generate(**request))
+            for request in requests
+        ]
+        return await asyncio.gather(*tasks)
+
     def generate(self, *args: Any, **kwargs: Any):
         if self._loop is None:
             self._loop = _BackgroundLoop()
         return self._loop.run(self.async_generate(*args, **kwargs))
+
+    def generate_many(self, requests: Sequence[Dict[str, Any]]) -> list[Any]:
+        if self._loop is None:
+            self._loop = _BackgroundLoop()
+        return self._loop.run(self.async_generate_many(requests))
 
     @torch.no_grad()
     def _compute_latent(

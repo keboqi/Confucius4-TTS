@@ -25,7 +25,7 @@ from confuciustts.frontend.text_normalizer import TextNormalizer
 from confuciustts.llm.llm import Text2Semantic, Text2SemanticConfig
 from confuciustts.utils.audio_features import mel_spectrogram
 from confuciustts.utils.audio_post import cross_fade_concat
-from confuciustts.utils.text_utils import LANGUAGE_TOKEN_MAP
+from confuciustts.utils.text_utils import get_language_token
 
 
 class _StepTimer:
@@ -253,6 +253,102 @@ class ConfuciusTTS:
         fbank = fbank - fbank.mean(dim=0, keepdim=True)
         return self.style_encoder(fbank.unsqueeze(0).to(self.device))
 
+    def _tokenize_segment(self, text: str, lang: str) -> torch.Tensor:
+        lang_token = get_language_token(lang)
+        formatted = f"You are a helpful assistant. {lang_token}:{text}"
+        return self.tokenizer.encode(formatted, return_tensors="pt").to(self.device)
+
+    def _generate_t2s(
+        self,
+        token_ids: torch.Tensor,
+        semantic_features: torch.Tensor,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        num_beams: int,
+        repetition_penalty: float,
+        max_length: int,
+        use_vllm: Optional[bool],
+    ) -> tuple[Any, str]:
+        t2s_backend, backend_name = self._select_t2s_backend(use_vllm)
+        kwargs = {
+            "text_inputs": token_ids,
+            "condition_vector": semantic_features,
+            "max_length": max_length,
+            "num_beams": num_beams,
+            "do_sample": True,
+            "top_p": top_p,
+            "top_k": top_k,
+            "temperature": temperature,
+            "repetition_penalty": repetition_penalty,
+            "early_stopping": True,
+            "return_latent": True,
+        }
+        if backend_name == "pytorch":
+            with self._pytorch_t2s_lock:
+                return t2s_backend.generate(**kwargs), backend_name
+        return t2s_backend.generate(**kwargs), backend_name
+
+    def _log_t2s_output(
+        self,
+        semantic_codes: torch.Tensor,
+        lm_latent: torch.Tensor,
+        verbose: bool,
+    ) -> None:
+        if not (verbose or os.getenv("CONFUCIUS_VLLM_DEBUG_GENERATION")):
+            return
+        codes_cpu = semantic_codes.detach().cpu().flatten()
+        unique, counts = torch.unique(codes_cpu, return_counts=True)
+        order = torch.argsort(counts, descending=True)[:10]
+        top_tokens = [
+            (int(unique[idx]), int(counts[idx]))
+            for idx in order
+        ]
+        print(
+            "[ConfuciusTTS] T2S output: "
+            f"tokens={semantic_codes.shape[1]}, "
+            f"latent={tuple(lm_latent.shape)}, "
+            f"first={codes_cpu[:16].tolist()}, "
+            f"last={codes_cpu[-16:].tolist()}, "
+            f"top={top_tokens}",
+            flush=True,
+        )
+
+    @torch.no_grad()
+    def _synth_audio_from_t2s(
+        self,
+        t2s_out: dict[str, torch.Tensor],
+        reference_mel: torch.Tensor,
+        style_embedding: torch.Tensor,
+        n_timesteps: int,
+        inference_cfg_rate: float,
+        verbose: bool,
+        timings: Optional[OrderedDict[str, float]] = None,
+    ) -> tuple[torch.Tensor, int]:
+        semantic_codes = t2s_out["semantic_codes"]  # (B, T_semantic)
+        lm_latent = t2s_out["latent"]  # (B, T_semantic, D_hidden)
+        self._log_t2s_output(semantic_codes, lm_latent, verbose)
+
+        # Predict target mel length (heuristic: 1.72x semantic length)
+        T = semantic_codes.shape[1]
+        target_lengths = torch.tensor([int(T * 1.72)], device=self.device)
+
+        # S2A: Generate mel-spectrogram from semantic tokens
+        with _StepTimer(self, timings, "s2a"):
+            mel = self.s2a_model.inference(
+                semantic_token=semantic_codes,
+                lm_latent=lm_latent,
+                prompt_feat=reference_mel,
+                embedding=style_embedding,
+                target_feat_len=target_lengths,
+                n_timesteps=n_timesteps,
+                inference_cfg_rate=inference_cfg_rate,
+            )
+        # Vocoder: mel to waveform.
+        with _StepTimer(self, timings, "vocoder"):
+            audio = self.bigvgan(mel.float().to(self.device)).squeeze(1)
+        return audio, T
+
     @torch.no_grad()
     def _synth_segment(
         self,
@@ -294,81 +390,105 @@ class ConfuciusTTS:
         Returns:
             Generated waveform, shape (1, T_audio)
         """
-        lang_token = LANGUAGE_TOKEN_MAP.get(lang, f"请用{lang}朗读接下来的文字")
-        formatted = f"You are a helpful assistant. {lang_token}:{text}"
         with _StepTimer(self, timings, "text_tokenize"):
-            token_ids = self.tokenizer.encode(formatted, return_tensors="pt").to(self.device)
+            token_ids = self._tokenize_segment(text, lang)
 
-        t2s_backend, backend_name = self._select_t2s_backend(use_vllm)
+        _, backend_name = self._select_t2s_backend(use_vllm)
         with _StepTimer(self, timings, f"t2s_{backend_name}"):
-            if backend_name == "pytorch":
-                with self._pytorch_t2s_lock:
-                    t2s_out = t2s_backend.generate(
-                        text_inputs=token_ids,
-                        condition_vector=semantic_features,
-                        max_length=max_length,
-                        num_beams=num_beams,
-                        do_sample=True,
-                        top_p=top_p,
-                        top_k=top_k,
-                        temperature=temperature,
-                        repetition_penalty=repetition_penalty,
-                        early_stopping=True,
-                        return_latent=True,
-                    )
-            else:
-                t2s_out = t2s_backend.generate(
-                    text_inputs=token_ids,
-                    condition_vector=semantic_features,
-                    max_length=max_length,
-                    num_beams=num_beams,
-                    do_sample=True,
-                    top_p=top_p,
-                    top_k=top_k,
-                    temperature=temperature,
-                    repetition_penalty=repetition_penalty,
-                    early_stopping=True,
-                    return_latent=True,
-                )
-        semantic_codes = t2s_out["semantic_codes"]  # (B, T_semantic)
-        lm_latent = t2s_out["latent"]  # (B, T_semantic, D_hidden)
-        if verbose or os.getenv("CONFUCIUS_VLLM_DEBUG_GENERATION"):
-            codes_cpu = semantic_codes.detach().cpu().flatten()
-            unique, counts = torch.unique(codes_cpu, return_counts=True)
-            order = torch.argsort(counts, descending=True)[:10]
-            top_tokens = [
-                (int(unique[idx]), int(counts[idx]))
-                for idx in order
-            ]
-            print(
-                "[ConfuciusTTS] T2S output: "
-                f"tokens={semantic_codes.shape[1]}, "
-                f"latent={tuple(lm_latent.shape)}, "
-                f"first={codes_cpu[:16].tolist()}, "
-                f"last={codes_cpu[-16:].tolist()}, "
-                f"top={top_tokens}",
-                flush=True,
+            t2s_out, _ = self._generate_t2s(
+                token_ids=token_ids,
+                semantic_features=semantic_features,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                num_beams=num_beams,
+                repetition_penalty=repetition_penalty,
+                max_length=max_length,
+                use_vllm=use_vllm,
             )
+        return self._synth_audio_from_t2s(
+            t2s_out=t2s_out,
+            reference_mel=reference_mel,
+            style_embedding=style_embedding,
+            n_timesteps=n_timesteps,
+            inference_cfg_rate=inference_cfg_rate,
+            verbose=verbose,
+            timings=timings,
+        )
 
-        # Predict target mel length (heuristic: 1.72x semantic length)
-        T = semantic_codes.shape[1]
-        target_lengths = torch.tensor([int(T * 1.72)], device=self.device)
+    @torch.no_grad()
+    def _synth_segments_with_parallel_vllm(
+        self,
+        segments: list[str],
+        lang: str,
+        semantic_features: torch.Tensor,
+        style_embedding: torch.Tensor,
+        reference_mel: torch.Tensor,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        num_beams: int,
+        repetition_penalty: float,
+        max_length: int,
+        n_timesteps: int,
+        inference_cfg_rate: float,
+        verbose: bool,
+        timings: Optional[OrderedDict[str, float]] = None,
+    ) -> tuple[list[torch.Tensor], int]:
+        if self.t2s_vllm is None:
+            raise RuntimeError("Parallel vLLM segment synthesis requires the vLLM backend.")
 
-        # S2A: Generate mel-spectrogram from semantic tokens
-        with _StepTimer(self, timings, "s2a"):
-            mel = self.s2a_model.inference(
-                semantic_token=semantic_codes,
-                lm_latent=lm_latent,
-                prompt_feat=reference_mel,
-                embedding=style_embedding,
-                target_feat_len=target_lengths,
+        with _StepTimer(self, timings, "text_tokenize"):
+            token_ids_by_segment = [
+                self._tokenize_segment(segment, lang)
+                for segment in segments
+            ]
+
+        requests = [
+            {
+                "text_inputs": token_ids,
+                "condition_vector": semantic_features,
+                "max_length": max_length,
+                "num_beams": num_beams,
+                "do_sample": True,
+                "top_p": top_p,
+                "top_k": top_k,
+                "temperature": temperature,
+                "repetition_penalty": repetition_penalty,
+                "early_stopping": True,
+                "return_latent": True,
+            }
+            for token_ids in token_ids_by_segment
+        ]
+
+        if verbose:
+            print(
+                f"[ConfuciusTTS] submitting {len(requests)} segment(s) "
+                "to vLLM in parallel"
+            )
+        with _StepTimer(self, timings, "t2s_vllm"):
+            t2s_outputs = self.t2s_vllm.generate_many(requests)
+
+        chunks = []
+        semantic_token_total = 0
+        for i, t2s_out in enumerate(t2s_outputs):
+            if verbose:
+                print(f"[ConfuciusTTS] rendering segment {i + 1}/{len(segments)}")
+            audio, semantic_tokens = self._synth_audio_from_t2s(
+                t2s_out=t2s_out,
+                reference_mel=reference_mel,
+                style_embedding=style_embedding,
                 n_timesteps=n_timesteps,
                 inference_cfg_rate=inference_cfg_rate,
+                verbose=verbose,
+                timings=timings,
             )
-        # Vocoder: Mel → Waveform
-        with _StepTimer(self, timings, "vocoder"):
-            audio = self.bigvgan(mel.float().to(self.device)).squeeze(1)
-        return audio, T
+            semantic_token_total += semantic_tokens
+            if audio.dim() == 1:
+                audio = audio.unsqueeze(0)
+            chunks.append(audio)
+
+        return chunks, semantic_token_total
 
     @torch.no_grad()
     def generate(
@@ -453,23 +573,44 @@ class ConfuciusTTS:
         if verbose:
             print(f"[ConfuciusTTS] {len(segments)} segment(s)")
 
-        # Synthesize each segment independently
-        chunks = []
-        semantic_token_total = 0
-        for i, seg in enumerate(segments):
-            if verbose:
+        if verbose:
+            for i, seg in enumerate(segments):
                 print(f"[ConfuciusTTS] segment {i + 1}/{len(segments)}: {seg!r}")
-            audio, semantic_tokens = self._synth_segment(
-                seg, lang, semantic_features, style_embedding, reference_mel,
-                temperature, top_p, top_k, num_beams, repetition_penalty,
-                max_length, n_timesteps, inference_cfg_rate, verbose,
-                use_vllm=use_vllm,
+
+        if backend_name == "vllm" and len(segments) > 1:
+            chunks, semantic_token_total = self._synth_segments_with_parallel_vllm(
+                segments=segments,
+                lang=lang,
+                semantic_features=semantic_features,
+                style_embedding=style_embedding,
+                reference_mel=reference_mel,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                num_beams=num_beams,
+                repetition_penalty=repetition_penalty,
+                max_length=max_length,
+                n_timesteps=n_timesteps,
+                inference_cfg_rate=inference_cfg_rate,
+                verbose=verbose,
                 timings=timings,
             )
-            semantic_token_total += semantic_tokens
-            if audio.dim() == 1:
-                audio = audio.unsqueeze(0)
-            chunks.append(audio)
+        else:
+            # Synthesize each segment independently.
+            chunks = []
+            semantic_token_total = 0
+            for seg in segments:
+                audio, semantic_tokens = self._synth_segment(
+                    seg, lang, semantic_features, style_embedding, reference_mel,
+                    temperature, top_p, top_k, num_beams, repetition_penalty,
+                    max_length, n_timesteps, inference_cfg_rate, verbose,
+                    use_vllm=use_vllm,
+                    timings=timings,
+                )
+                semantic_token_total += semantic_tokens
+                if audio.dim() == 1:
+                    audio = audio.unsqueeze(0)
+                chunks.append(audio)
 
         # Merge segments with cross-fade
         with _StepTimer(self, timings, "merge_segments"):
