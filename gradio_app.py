@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import wave
 from contextlib import nullcontext
 from pathlib import Path
@@ -210,6 +211,84 @@ def _load_serving_model(
         gpu_stage_concurrency=gpu_stage_concurrency,
         reference_cache_size=reference_cache_size,
     )
+
+
+def _configure_compile_cache(enabled: bool, cache_dir: str) -> Optional[Path]:
+    if not enabled:
+        return None
+
+    cache_path = Path(cache_dir).expanduser()
+    if not cache_path.is_absolute():
+        cache_path = ROOT_DIR / cache_path
+    cache_path = cache_path.resolve()
+    cache_path.mkdir(parents=True, exist_ok=True)
+
+    os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
+    os.environ.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "1")
+    os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(cache_path))
+    cache_path = Path(os.environ["TORCHINDUCTOR_CACHE_DIR"]).expanduser().resolve()
+    cache_path.mkdir(parents=True, exist_ok=True)
+    triton_cache_path = cache_path / "triton"
+    triton_cache_path.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("TRITON_CACHE_DIR", str(triton_cache_path))
+    return cache_path
+
+
+def _warmup_serving_model(
+    model: Any,
+    *,
+    prompt_wav: str,
+    text: str,
+    lang: str,
+    diffusion_steps: int,
+    cfg_strength: float,
+) -> bool:
+    text = (text or "Hello, welcome to Confucius4-TTS.").strip()
+    lang = (lang or "en").strip()
+    diffusion_steps = max(1, int(diffusion_steps))
+
+    started = time.perf_counter()
+    try:
+        prompt_wav = _resolve_repo_path(prompt_wav, "Warmup reference audio")
+        with torch.inference_mode():
+            audio = model.generate(
+                text=text,
+                lang=lang,
+                prompt_wav=prompt_wav,
+                temperature=0.8,
+                top_p=0.8,
+                top_k=30,
+                num_beams=3,
+                repetition_penalty=10.0,
+                max_length=1520,
+                n_timesteps=diffusion_steps,
+                inference_cfg_rate=cfg_strength,
+                max_text_tokens_per_segment=80,
+                segment_render_batch_size=1,
+                target_duration_seconds=0.0,
+                cross_fade_duration=0.3,
+                verbose=False,
+                use_vllm=True,
+            )
+            if audio.numel() <= 0:
+                raise RuntimeError("warmup produced empty audio")
+            model._sync_device()
+    except Exception:
+        traceback.print_exc()
+        print(
+            "[Confucius4-TTS] Startup warmup failed; continuing without a "
+            "prewarmed first request.",
+            flush=True,
+        )
+        return False
+
+    print(
+        "[Confucius4-TTS] Startup warmup completed in "
+        f"{time.perf_counter() - started:.2f}s "
+        f"(prompt_wav={prompt_wav}).",
+        flush=True,
+    )
+    return True
 
 
 def _vllm_model() -> Any:
@@ -804,6 +883,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--s2a-length-bucket-size", type=int,
                         default=int(os.getenv("CONFUCIUS_S2A_LENGTH_BUCKET_SIZE", "64")),
                         help="Bucket multi-segment S2A batches by total mel length. 0 disables bucketing.")
+    parser.add_argument("--compile-cache", action=argparse.BooleanOptionalAction,
+                        default=_env_bool("CONFUCIUS_COMPILE_CACHE", True),
+                        help="Persist torch.compile/Triton artifacts across Gradio restarts.")
+    parser.add_argument("--compile-cache-dir",
+                        default=os.getenv("CONFUCIUS_COMPILE_CACHE_DIR", "outputs/compile-cache/torchinductor"),
+                        help="Directory for persistent torch.compile/Triton artifacts.")
+    parser.add_argument("--warmup", action=argparse.BooleanOptionalAction,
+                        default=_env_bool("CONFUCIUS_WARMUP", True),
+                        help="Run a real generation at startup so the first user request is warm.")
+    parser.add_argument("--warmup-prompt-wav",
+                        default=os.getenv("CONFUCIUS_WARMUP_PROMPT_WAV", "resources/voice.mp3"),
+                        help="Reference audio used for startup warmup generation.")
+    parser.add_argument("--warmup-text", default=os.getenv("CONFUCIUS_WARMUP_TEXT", "Hello, welcome to Confucius4-TTS."))
+    parser.add_argument("--warmup-lang", default=os.getenv("CONFUCIUS_WARMUP_LANG", "en"),
+                        choices=[_language_code(choice) for choice in LANGUAGE_CHOICES])
+    parser.add_argument("--warmup-diffusion-steps", type=int,
+                        default=int(os.getenv("CONFUCIUS_WARMUP_DIFFUSION_STEPS", "10")),
+                        help="S2A diffusion steps used by startup warmup.")
     parser.add_argument("--profile-cuda", action=argparse.BooleanOptionalAction,
                         default=_env_bool("CONFUCIUS_PROFILE_CUDA", False),
                         help="Write torch profiler traces for S2A and BigVGAN stages.")
@@ -851,6 +948,8 @@ def main() -> None:
         raise gr.Error("--concurrency-limit must be at least 1.")
     if args.s2a_length_bucket_size < 0:
         raise gr.Error("--s2a-length-bucket-size must be zero or greater.")
+    if args.warmup_diffusion_steps < 1:
+        raise gr.Error("--warmup-diffusion-steps must be at least 1.")
     if args.gpu_stage_concurrency < 1:
         raise gr.Error("--gpu-stage-concurrency must be at least 1.")
     if args.reference_cache_size < 0:
@@ -877,6 +976,10 @@ def main() -> None:
     SERVE_DETAILED_TIMINGS = bool(args.detailed_timings)
     SERVE_POSTPROCESS_SEMAPHORE = threading.Semaphore(int(args.postprocess_concurrency))
     SERVE_ORIGINAL_SEMAPHORE = threading.Semaphore(SERVE_GPU_STAGE_CONCURRENCY)
+    compile_cache_dir = _configure_compile_cache(
+        enabled=bool(args.compile_cache),
+        cache_dir=args.compile_cache_dir,
+    )
     compile_s2a_label = "auto" if SERVE_COMPILE_S2A is None else str(SERVE_COMPILE_S2A)
     bigvgan_kernel_label = (
         "auto"
@@ -896,7 +999,9 @@ def main() -> None:
         f"detailed_timings={SERVE_DETAILED_TIMINGS}, "
         f"s2a_dtype={SERVE_S2A_DTYPE}, "
         f"s2a_sdpa_backend={SERVE_S2A_SDPA_BACKEND}, "
-        f"s2a_length_bucket_size={SERVE_S2A_LENGTH_BUCKET_SIZE})..."
+        f"s2a_length_bucket_size={SERVE_S2A_LENGTH_BUCKET_SIZE}, "
+        f"compile_cache_dir={compile_cache_dir or 'disabled'}, "
+        f"warmup={bool(args.warmup)})..."
     )
     SERVE_MODEL = _load_serving_model(
         config_path=config_path,
@@ -921,6 +1026,15 @@ def main() -> None:
         reference_cache_size=SERVE_REFERENCE_CACHE_SIZE,
     )
     print("[Confucius4-TTS] vLLM-backed TTS model is ready.")
+    if args.warmup:
+        _warmup_serving_model(
+            SERVE_MODEL,
+            prompt_wav=args.warmup_prompt_wav,
+            text=args.warmup_text,
+            lang=args.warmup_lang,
+            diffusion_steps=args.warmup_diffusion_steps,
+            cfg_strength=0.7,
+        )
 
     launch_kwargs = {
         "server_name": args.server_name,

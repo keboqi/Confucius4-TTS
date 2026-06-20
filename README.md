@@ -154,9 +154,21 @@ S2A diffusion uses `torch.compile` by default on CUDA. This can improve
 repeated-generation throughput after the first compile/warmup pass, but startup
 and the first request will take longer. Use `--no-compile-s2a` to disable it.
 The launcher also accepts the IndexTTS-style alias `--use-torch-compile`.
+The Gradio launcher enables PyTorch Inductor's persistent FX graph and
+AOTAutograd caches by default under `outputs/compile-cache/torchinductor`, so
+compiled S2A artifacts can be reused after a service restart. Override the
+location with `--compile-cache-dir` or disable the launcher default with
+`--no-compile-cache`.
 The S2A compile path keeps Inductor kernels enabled but disables Inductor CUDA
 graph capture because prompt/text-dependent dynamic shapes can otherwise create
 many graph recordings and fail inside Gradio worker threads.
+
+The Gradio service also runs a real startup generation by default, using
+`resources/voice.mp3` and `Hello, welcome to Confucius4-TTS.`. This prewarms
+audio loading, reference conditioning, the vLLM request path, S2A, and BigVGAN
+before the first user clicks "Generate with vLLM"; use `--no-warmup` if you
+prefer faster server startup over faster first-request latency. Override the
+warmup reference or text with `--warmup-prompt-wav` and `--warmup-text`.
 
 S2A DiT attention uses PyTorch SDPA. By default PyTorch chooses the backend, but
 you can force a backend for validation with `--s2a-sdpa-backend flash`,
