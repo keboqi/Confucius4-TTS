@@ -51,6 +51,14 @@ class LearnedPositionalEmbedding(nn.Module):
             Input with positional embeddings added, shape (B, T, D)
         """
         seq_len = x.shape[1]
+        max_seq_len = self.embedding.num_embeddings
+        if seq_len > max_seq_len:
+            raise ValueError(
+                "Positional embedding input is longer than the configured "
+                f"limit: seq_len={seq_len}, max_seq_len={max_seq_len}. "
+                "Split the text or reduce generated semantic length before "
+                "running the model."
+            )
         positions = torch.arange(seq_len, device=x.device)
         return x + self.embedding(positions).unsqueeze(0).expand(x.shape[0], -1, -1)
 
@@ -64,5 +72,11 @@ class LearnedPositionalEmbedding(nn.Module):
         Returns:
             Position embedding, shape (1, 1, D)
         """
+        max_seq_len = self.embedding.num_embeddings
+        if position < 0 or position >= max_seq_len:
+            raise ValueError(
+                "Requested positional embedding is outside the configured "
+                f"range: position={position}, max_seq_len={max_seq_len}."
+            )
         pos_tensor = torch.tensor([position], device=device)
         return self.embedding(pos_tensor).unsqueeze(0)

@@ -333,6 +333,66 @@ class ConfuciusTTS:
     def _text_vocab_size(self) -> int:
         return int(self.t2s_model.text_projector.embed.num_embeddings)
 
+    def _text_position_limit(self) -> Optional[int]:
+        embedding = getattr(self.t2s_model.text_position_embedding, "embedding", None)
+        if embedding is not None:
+            return int(embedding.num_embeddings)
+        return getattr(self.t2s_model.config, "max_text_seq_lens", None)
+
+    def _format_text_prompt(self, text: str, lang: str) -> str:
+        lang_token = get_language_token(lang)
+        return f"You are a helpful assistant. {lang_token}:{text}"
+
+    def _encoded_text_prompt_length(self, text: str, lang: str) -> int:
+        return len(self.tokenizer.encode(self._format_text_prompt(text, lang)))
+
+    def _split_segment_to_text_limit(self, text: str, lang: str) -> list[str]:
+        max_len = self._text_position_limit()
+        if max_len is None or self._encoded_text_prompt_length(text, lang) <= max_len:
+            return [text]
+
+        chunks: list[str] = []
+        remaining = text
+        punctuation = "。！？!?.,;:、，"
+        while remaining:
+            low = 1
+            high = len(remaining)
+            best = 0
+            while low <= high:
+                mid = (low + high) // 2
+                if self._encoded_text_prompt_length(remaining[:mid], lang) <= max_len:
+                    best = mid
+                    low = mid + 1
+                else:
+                    high = mid - 1
+
+            if best == 0:
+                raise ValueError(
+                    "A single text character exceeds the T2S text position "
+                    f"limit for lang={lang!r}: max_text_seq_lens={max_len}, "
+                    f"text starts with {remaining[:16]!r}."
+                )
+
+            cut = best
+            min_cut = max(1, best // 2)
+            for idx in range(best - 1, min_cut - 1, -1):
+                if remaining[idx] in punctuation or remaining[idx].isspace():
+                    cut = idx + 1
+                    break
+
+            chunk = remaining[:cut].strip()
+            if chunk:
+                chunks.append(chunk)
+            remaining = remaining[cut:].strip()
+
+        return chunks
+
+    def _fit_segments_to_text_limit(self, segments: list[str], lang: str) -> list[str]:
+        fitted: list[str] = []
+        for segment in segments:
+            fitted.extend(self._split_segment_to_text_limit(segment, lang))
+        return fitted
+
     def _validate_text_token_ids(
         self,
         token_ids: torch.Tensor,
@@ -342,6 +402,14 @@ class ConfuciusTTS:
         vocab_size = self._text_vocab_size()
         if token_ids.numel() == 0:
             raise ValueError(f"Tokenizer returned no IDs for {lang!r} text: {text!r}")
+        max_len = self._text_position_limit()
+        if max_len is not None and token_ids.shape[-1] > max_len:
+            raise ValueError(
+                "Formatted text prompt exceeds the T2S text position limit: "
+                f"lang={lang!r}, token_count={token_ids.shape[-1]}, "
+                f"max_text_seq_lens={max_len}, text={text!r}. "
+                "This would otherwise trigger a CUDA position embedding assert."
+            )
         invalid = (token_ids < 0) | (token_ids >= vocab_size)
         if not invalid.any():
             return
@@ -353,9 +421,10 @@ class ConfuciusTTS:
         )
 
     def _tokenize_segment(self, text: str, lang: str) -> torch.Tensor:
-        lang_token = get_language_token(lang)
-        formatted = f"You are a helpful assistant. {lang_token}:{text}"
-        token_ids = self.tokenizer.encode(formatted, return_tensors="pt")
+        token_ids = self.tokenizer.encode(
+            self._format_text_prompt(text, lang),
+            return_tensors="pt",
+        )
         self._validate_text_token_ids(token_ids, text, lang)
         return token_ids.to(self.device)
 
@@ -927,14 +996,23 @@ class ConfuciusTTS:
         with _StepTimer(self, timings, "segment_text"):
             segments = self.normalizer.segment_text(
                 text,
-                tokenize_fn=self.tokenizer.tokenize,
+                tokenize_fn=lambda value: self.tokenizer.tokenize(
+                    self._format_text_prompt(value, lang)
+                ),
                 language=lang,
                 max_tokens=max_text_tokens_per_segment,
             )
-        if not segments:
-            segments = [text]
+            if not segments:
+                segments = [text]
+            original_segment_count = len(segments)
+            segments = self._fit_segments_to_text_limit(segments, lang)
         if verbose:
             print(f"[ConfuciusTTS] {len(segments)} segment(s)")
+            if len(segments) != original_segment_count:
+                print(
+                    "[ConfuciusTTS] split overlong formatted T2S prompt(s) "
+                    f"from {original_segment_count} to {len(segments)} segment(s)"
+                )
 
         if verbose:
             for i, seg in enumerate(segments):

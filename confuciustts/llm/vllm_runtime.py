@@ -125,6 +125,22 @@ class Text2SemanticVLLM:
             )
         )
 
+    def _text_position_limit(self) -> Optional[int]:
+        embedding = getattr(self.torch_model.text_position_embedding, "embedding", None)
+        if embedding is not None:
+            return int(embedding.num_embeddings)
+        return getattr(self.torch_model.config, "max_text_seq_lens", None)
+
+    def _semantic_position_limit(self) -> Optional[int]:
+        embedding = getattr(
+            self.torch_model.semantic_position_embedding,
+            "embedding",
+            None,
+        )
+        if embedding is not None:
+            return int(embedding.num_embeddings)
+        return getattr(self.torch_model.config, "max_semantic_seq_lens", None)
+
     def _sanitize_generated_token_ids(
         self,
         token_ids: Sequence[int],
@@ -161,6 +177,14 @@ class Text2SemanticVLLM:
         return cleaned
 
     def _validate_text_token_ids(self, text_inputs: torch.Tensor) -> None:
+        max_len = self._text_position_limit()
+        if max_len is not None and text_inputs.shape[1] > max_len:
+            raise ValueError(
+                "Text prompt exceeds the T2S text position limit before vLLM "
+                f"prefix construction: token_count={text_inputs.shape[1]}, "
+                f"max_text_seq_lens={max_len}. Split the input text into "
+                "smaller segments."
+            )
         vocab_size = int(self.torch_model.text_projector.embed.num_embeddings)
         invalid = (text_inputs < 0) | (text_inputs >= vocab_size)
         if not invalid.any():
@@ -265,6 +289,9 @@ class Text2SemanticVLLM:
             condition_vector,
         )
         max_tokens = max(1, int(max_length) - prefix_embeds.shape[1])
+        semantic_limit = self._semantic_position_limit()
+        if semantic_limit is not None:
+            max_tokens = min(max_tokens, max(1, semantic_limit - 2))
         sampling_params = self._sampling_params(
             max_tokens=max_tokens,
             temperature=temperature,
@@ -352,6 +379,14 @@ class Text2SemanticVLLM:
         model = self.torch_model
         device = text_inputs.device
         batch_size = text_inputs.shape[0]
+        semantic_limit = self._semantic_position_limit()
+        if semantic_limit is not None and semantic_codes.shape[1] + 2 > semantic_limit:
+            raise ValueError(
+                "Generated semantic sequence exceeds the T2S semantic position "
+                f"limit before latent computation: token_count={semantic_codes.shape[1]}, "
+                f"bounded_token_count={semantic_codes.shape[1] + 2}, "
+                f"max_semantic_seq_lens={semantic_limit}."
+            )
         bos = torch.full(
             (batch_size, 1),
             model.config.start_semantic_token,
