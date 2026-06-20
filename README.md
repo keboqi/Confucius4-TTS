@@ -150,6 +150,9 @@ S2A diffusion uses `torch.compile` by default on CUDA. This can improve
 repeated-generation throughput after the first compile/warmup pass, but startup
 and the first request will take longer. Use `--no-compile-s2a` to disable it.
 The launcher also accepts the IndexTTS-style alias `--use-torch-compile`.
+The S2A compile path keeps Inductor kernels enabled but disables Inductor CUDA
+graph capture because prompt/text-dependent dynamic shapes can otherwise create
+many graph recordings and fail inside Gradio worker threads.
 
 BigVGAN uses NVIDIA's fused CUDA activation kernel automatically on CUDA,
 matching the IndexTTS fast path. Use `--no-use-bigvgan-cuda-kernel` to disable

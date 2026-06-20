@@ -20,6 +20,38 @@ import torch.nn.functional as F
 from confuciustts.flow.DiT.dit import DiT
 
 
+def _set_inductor_config(path: str, value) -> bool:
+    try:
+        import torch._inductor.config as inductor_config
+    except Exception:
+        return False
+
+    target = inductor_config
+    parts = path.split(".")
+    try:
+        for part in parts[:-1]:
+            target = getattr(target, part)
+        setattr(target, parts[-1], value)
+    except Exception:
+        return False
+    return True
+
+
+def _configure_torch_compile_for_s2a() -> None:
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+
+    # S2A generation has many prompt/text-dependent sequence lengths. Inductor
+    # CUDA graphs add overhead for those dynamic shapes and can fail in Gradio
+    # worker threads with cudagraph_trees TLS assertions, so keep compiled
+    # kernels but disable CUDA graph capture for this path.
+    _set_inductor_config("triton.cudagraphs", False)
+    _set_inductor_config("triton.cudagraph_skip_dynamic_graphs", True)
+    _set_inductor_config("triton.cudagraph_dynamic_shape_warn_limit", None)
+
+
 class ConditionalCFM(nn.Module):
     """Conditional Flow Matching decoder with classifier-free guidance.
 
@@ -98,6 +130,7 @@ class ConditionalCFM(nn.Module):
         """Compile the DiT estimator used by the S2A flow decoder."""
         if self.torch_compile_enabled:
             return
+        _configure_torch_compile_for_s2a()
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch._inductor.config.reorder_for_compute_comm_overlap = True
         self.estimator = torch.compile(
