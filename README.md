@@ -180,10 +180,12 @@ curl -X POST http://127.0.0.1:8000/v1/tts \
     -H "Content-Type: application/json" \
     -d '{
       "text": "Hello, this is a test of zero-shot voice cloning.",
-      "lang": "en",
-      "prompt_wav": "resources/voice.mp3"
+      "lang": "en"
     }'
 ```
+
+When `prompt_wav` is omitted or empty, the API uses `resources/voice.mp3` as the
+default reference voice.
 
 Direct WAV response:
 

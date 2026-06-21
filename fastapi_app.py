@@ -31,6 +31,7 @@ if str(ROOT_DIR) not in sys.path:
 import gradio_app as serving
 
 API_VERSION = "0.1.0"
+DEFAULT_PROMPT_WAV = "resources/voice.mp3"
 DEFAULT_OUTPUT_DIR = ROOT_DIR / "outputs" / "api"
 API_OUTPUT_DIR = DEFAULT_OUTPUT_DIR
 REFERENCE_UPLOAD_SUFFIXES = {".wav", ".mp3", ".flac", ".m4a", ".ogg", ".aac"}
@@ -137,8 +138,11 @@ class TTSRequest(BaseModel):
     text: str = Field(..., min_length=1)
     lang: str = Field("en", description="Language code such as en, zh, ja, ko.")
     prompt_wav: Optional[str] = Field(
-        None,
-        description="Server-side reference audio path. Omit to use resources/voice.mp3.",
+        DEFAULT_PROMPT_WAV,
+        description=(
+            "Server-side reference audio path. Omit or leave empty to use "
+            f"{DEFAULT_PROMPT_WAV}."
+        ),
     )
     temperature: float = Field(0.8, ge=0.0)
     top_p: float = Field(0.8, gt=0.0, le=1.0)
@@ -649,19 +653,29 @@ def create_app(
     @app.post("/v1/tts/upload", response_model=TTSResponse, tags=["tts"])
     async def synthesize_with_uploaded_reference(
         payload: str = Form(..., description="JSON-encoded TTSRequest."),
-        prompt_wav: UploadFile = File(...),
+        prompt_wav: Optional[UploadFile] = File(
+            None,
+            description=f"Optional reference audio file. Omit to use {DEFAULT_PROMPT_WAV}.",
+        ),
     ) -> TTSResponse:
-        reference_path = await _save_uploaded_reference(prompt_wav)
         request = _parse_payload(payload)
+        reference_path = None
+        if prompt_wav is not None:
+            reference_path = await _save_uploaded_reference(prompt_wav)
         return await _run_synthesis(request, prompt_wav_override=reference_path)
 
     @app.post("/v1/tts/upload/audio", tags=["tts"])
     async def synthesize_uploaded_reference_audio(
         payload: str = Form(..., description="JSON-encoded TTSRequest."),
-        prompt_wav: UploadFile = File(...),
+        prompt_wav: Optional[UploadFile] = File(
+            None,
+            description=f"Optional reference audio file. Omit to use {DEFAULT_PROMPT_WAV}.",
+        ),
     ) -> FileResponse:
-        reference_path = await _save_uploaded_reference(prompt_wav)
         request = _copy_request(_parse_payload(payload), include_audio_base64=False)
+        reference_path = None
+        if prompt_wav is not None:
+            reference_path = await _save_uploaded_reference(prompt_wav)
         response = await _run_synthesis(request, prompt_wav_override=reference_path)
         return FileResponse(
             response.audio_path,
