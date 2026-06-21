@@ -270,30 +270,33 @@ def _warmup_serving_model(
     diffusion_steps = max(1, int(diffusion_steps))
 
     started = time.perf_counter()
+    warmup_outputs: list[Path] = []
     try:
         prompt_wav = _resolve_repo_path(prompt_wav, "Warmup reference audio")
         with torch.inference_mode():
-            audio = model.generate(
-                text=text,
-                lang=lang,
+            # Exercise the same path as the Gradio vLLM button, including
+            # output file writing and MP3 preview encoding.
+            preview_output, wav_output, _status = _synthesize(
+                use_vllm=True,
                 prompt_wav=prompt_wav,
+                text=text,
+                language=lang,
                 temperature=0.8,
                 top_p=0.8,
                 top_k=30,
                 num_beams=3,
                 repetition_penalty=10.0,
                 max_length=1520,
-                n_timesteps=diffusion_steps,
-                inference_cfg_rate=cfg_strength,
-                max_text_tokens_per_segment=80,
+                diffusion_steps=diffusion_steps,
+                cfg_strength=cfg_strength,
+                max_text_tokens=80,
                 segment_render_batch_size=1,
                 target_duration_seconds=0.0,
+                target_segment_durations="",
                 cross_fade_duration=0.3,
                 verbose=False,
-                use_vllm=True,
             )
-            if audio.numel() <= 0:
-                raise RuntimeError("warmup produced empty audio")
+            warmup_outputs = [Path(preview_output), Path(wav_output)]
             model._sync_device()
     except Exception:
         traceback.print_exc()
@@ -303,9 +306,15 @@ def _warmup_serving_model(
             flush=True,
         )
         return False
+    finally:
+        for output in warmup_outputs:
+            try:
+                output.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     print(
-        "[Confucius4-TTS] Startup warmup completed in "
+        "[Confucius4-TTS] Startup UI warmup completed in "
         f"{time.perf_counter() - started:.2f}s "
         f"(prompt_wav={prompt_wav}).",
         flush=True,
