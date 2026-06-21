@@ -185,14 +185,24 @@ curl -X POST http://127.0.0.1:8000/v1/tts \
 ```
 
 When `prompt_wav` is omitted or empty, the API uses `resources/voice.mp3` as the
-default reference voice.
+default reference voice. The API returns MP3 by default, matching the Gradio
+preview output. Set `"output_format": "wav"` when a client needs the WAV file.
+
+Direct MP3 response:
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/tts/audio \
+    -H "Content-Type: application/json" \
+    -d '{"text":"Hello from the API.","lang":"en"}' \
+    --output output.mp3
+```
 
 Direct WAV response:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/v1/tts/audio \
     -H "Content-Type: application/json" \
-    -d '{"text":"Hello from the API.","lang":"en"}' \
+    -d '{"text":"Hello from the API.","lang":"en","output_format":"wav"}' \
     --output output.wav
 ```
 
@@ -202,7 +212,7 @@ Upload a reference audio file with a JSON payload:
 curl -X POST http://127.0.0.1:8000/v1/tts/upload/audio \
     -F 'payload={"text":"Hello with an uploaded voice.","lang":"en"}' \
     -F prompt_wav=@resources/voice.mp3 \
-    --output output.wav
+    --output output.mp3
 ```
 
 The generated files are stored under `outputs/api` by default. Override that

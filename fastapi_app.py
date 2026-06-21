@@ -161,6 +161,10 @@ class TTSRequest(BaseModel):
         description="Optional per-segment duration targets in seconds.",
     )
     cross_fade_duration: float = Field(0.3, ge=0.0)
+    output_format: str = Field(
+        "mp3",
+        description="Response audio format: mp3 by default, or wav.",
+    )
     verbose: bool = False
     include_audio_base64: bool = False
 
@@ -169,10 +173,13 @@ class TTSResponse(BaseModel):
     request_id: str
     lang: str
     sample_rate: int
+    output_format: str
     duration_seconds: float
     elapsed_seconds: float
     audio_path: str
     audio_url: str
+    wav_path: str
+    wav_url: str
     audio_base64: Optional[str] = None
     timings: Optional[dict[str, Any]] = None
 
@@ -403,6 +410,13 @@ def _normalize_segment_durations(
     return normalized
 
 
+def _normalize_output_format(value: str) -> str:
+    normalized = (value or "mp3").strip().lower()
+    if normalized not in {"mp3", "wav"}:
+        raise ValueError("output_format must be one of: mp3, wav.")
+    return normalized
+
+
 def _new_request_id() -> str:
     return uuid.uuid4().hex
 
@@ -414,6 +428,15 @@ def _new_output_path(request_id: str) -> Path:
 
 def _audio_url(output_path: Path) -> str:
     return f"/v1/audio/{output_path.name}"
+
+
+def _audio_media_type(path: str | Path) -> str:
+    suffix = Path(path).suffix.lower()
+    if suffix == ".mp3":
+        return "audio/mpeg"
+    if suffix == ".wav":
+        return "audio/wav"
+    return "application/octet-stream"
 
 
 def _timings_payload(timing_info: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
@@ -437,12 +460,13 @@ def _synthesize_sync(
 
     lang = _normalize_language(request.lang)
     prompt_wav = _normalize_reference_path(prompt_wav_override or request.prompt_wav)
+    output_format = _normalize_output_format(request.output_format)
     target_segment_durations = _normalize_segment_durations(
         request.target_segment_durations
     )
     model = _model()
     request_id = _new_request_id()
-    output = _new_output_path(request_id)
+    wav_output = _new_output_path(request_id)
 
     started = time.perf_counter()
     result = model.generate(
@@ -472,7 +496,7 @@ def _synthesize_sync(
         audio = result
         timing_info = None
 
-    output.parent.mkdir(parents=True, exist_ok=True)
+    wav_output.parent.mkdir(parents=True, exist_ok=True)
     with (serving.SERVE_POSTPROCESS_SEMAPHORE or nullcontext()):
         save_started = time.perf_counter()
         if (
@@ -482,28 +506,36 @@ def _synthesize_sync(
         ):
             torch.cuda.synchronize(model.device)
         audio_cpu = audio.detach().float().cpu()
-        torchaudio.save(str(output), audio_cpu, model.sample_rate)
+        torchaudio.save(str(wav_output), audio_cpu, model.sample_rate)
         save_elapsed = time.perf_counter() - save_started
+        mp3_started = time.perf_counter()
+        mp3_output = serving._save_mp3_preview(wav_output, audio_cpu, model.sample_rate)
+        mp3_elapsed = time.perf_counter() - mp3_started
 
     elapsed = time.perf_counter() - started
     duration_seconds = audio_cpu.shape[-1] / model.sample_rate
     timings = _timings_payload(timing_info)
     if timings is not None:
         timings["save_wav"] = save_elapsed
+        timings["save_mp3"] = mp3_elapsed
         timings["request_total"] = elapsed
+    selected_output = mp3_output if output_format == "mp3" else wav_output
 
     audio_base64 = None
     if request.include_audio_base64:
-        audio_base64 = base64.b64encode(output.read_bytes()).decode("ascii")
+        audio_base64 = base64.b64encode(selected_output.read_bytes()).decode("ascii")
 
     return TTSResponse(
         request_id=request_id,
         lang=lang,
         sample_rate=int(model.sample_rate),
+        output_format=output_format,
         duration_seconds=float(duration_seconds),
         elapsed_seconds=float(elapsed),
-        audio_path=str(output),
-        audio_url=_audio_url(output),
+        audio_path=str(selected_output),
+        audio_url=_audio_url(selected_output),
+        wav_path=str(wav_output),
+        wav_url=_audio_url(wav_output),
         audio_base64=audio_base64,
         timings=timings,
     )
@@ -607,6 +639,7 @@ def _ui_html() -> str:
             "segment_render_batch_size": 1,
             "target_duration_seconds": 0,
             "cross_fade_duration": 0.3,
+            "output_format": "mp3",
         }
     )
     return f"""<!doctype html>
@@ -795,6 +828,12 @@ def _ui_html() -> str:
           <label>Server Reference
             <input id="prompt_wav" value="{DEFAULT_PROMPT_WAV}">
           </label>
+          <label>Output
+            <select id="output_format">
+              <option value="mp3" selected>MP3</option>
+              <option value="wav">WAV</option>
+            </select>
+          </label>
           <label class="wide">Upload Reference
             <input id="prompt_file" type="file" accept="audio/*">
           </label>
@@ -869,6 +908,7 @@ def _ui_html() -> str:
         text: document.getElementById('text').value,
         lang: document.getElementById('lang').value,
         prompt_wav: document.getElementById('prompt_wav').value || defaults.prompt_wav,
+        output_format: document.getElementById('output_format').value || defaults.output_format,
       }};
       for (const id of fields) data[id] = numberValue(id);
       const segmentDurations = document.getElementById('target_segment_durations').value
@@ -891,7 +931,7 @@ def _ui_html() -> str:
         ? result.elapsed_seconds.toFixed(2) + 's'
         : '-';
       document.getElementById('download').innerHTML = result.audio_url
-        ? '<a href="' + result.audio_url + '">WAV</a>'
+        ? '<a href="' + result.audio_url + '">' + (result.output_format || 'audio').toUpperCase() + '</a>'
         : '-';
       jsonEl.textContent = JSON.stringify(result, null, 2);
     }}
@@ -946,6 +986,7 @@ def _ui_html() -> str:
     document.getElementById('reset').addEventListener('click', () => {{
       form.reset();
       document.getElementById('prompt_wav').value = defaults.prompt_wav;
+      document.getElementById('output_format').value = defaults.output_format;
       audioEl.removeAttribute('src');
       document.getElementById('request-id').textContent = '-';
       document.getElementById('duration').textContent = '-';
@@ -1018,10 +1059,11 @@ def create_app(
         response = await _run_synthesis(_copy_request(request, include_audio_base64=False))
         return FileResponse(
             response.audio_path,
-            media_type="audio/wav",
+            media_type=_audio_media_type(response.audio_path),
             filename=Path(response.audio_path).name,
             headers={
                 "X-Confucius-Request-ID": response.request_id,
+                "X-Confucius-Output-Format": response.output_format,
                 "X-Confucius-Sample-Rate": str(response.sample_rate),
                 "X-Confucius-Duration-Seconds": f"{response.duration_seconds:.6f}",
                 "X-Confucius-Elapsed-Seconds": f"{response.elapsed_seconds:.6f}",
@@ -1057,10 +1099,11 @@ def create_app(
         response = await _run_synthesis(request, prompt_wav_override=reference_path)
         return FileResponse(
             response.audio_path,
-            media_type="audio/wav",
+            media_type=_audio_media_type(response.audio_path),
             filename=Path(response.audio_path).name,
             headers={
                 "X-Confucius-Request-ID": response.request_id,
+                "X-Confucius-Output-Format": response.output_format,
                 "X-Confucius-Sample-Rate": str(response.sample_rate),
                 "X-Confucius-Duration-Seconds": f"{response.duration_seconds:.6f}",
                 "X-Confucius-Elapsed-Seconds": f"{response.elapsed_seconds:.6f}",
@@ -1072,7 +1115,7 @@ def create_app(
         path = _resolve_download_path(file_name)
         return FileResponse(
             str(path),
-            media_type="audio/wav",
+            media_type=_audio_media_type(path),
             filename=path.name,
         )
 
