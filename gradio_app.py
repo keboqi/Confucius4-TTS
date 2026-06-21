@@ -12,9 +12,10 @@ import threading
 import time
 import traceback
 import wave
+from collections import OrderedDict
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 import gradio as gr
 import torch
@@ -22,6 +23,7 @@ import torchaudio
 
 ROOT_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = ROOT_DIR / "outputs" / "gradio"
+DEFAULT_REFERENCE_WAV = ROOT_DIR / "resources" / "voice.mp3"
 SERVE_MODEL: Any = None
 SERVE_DEVICE = "cuda"
 SERVE_CONFIG_PATH: Optional[str] = None
@@ -41,6 +43,7 @@ SERVE_REFERENCE_CACHE_SIZE = 16
 SERVE_DETAILED_TIMINGS = False
 SERVE_POSTPROCESS_SEMAPHORE: Optional[threading.Semaphore] = None
 SERVE_ORIGINAL_SEMAPHORE: Optional[threading.Semaphore] = None
+ORIGINAL_STREAM_FIRST_SEGMENT_TOKENS = 20
 
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
@@ -65,6 +68,24 @@ LANGUAGE_CHOICES = [
 
 def _language_code(choice: str) -> str:
     return choice.split(" - ", 1)[0].strip()
+
+
+def _reference_wav_or_default(prompt_wav: Optional[str]) -> str:
+    if prompt_wav and str(prompt_wav).strip():
+        path = Path(str(prompt_wav).strip()).expanduser()
+    else:
+        path = DEFAULT_REFERENCE_WAV
+
+    if not path.is_absolute():
+        path = ROOT_DIR / path
+    path = path.resolve()
+    if not path.exists():
+        if path == DEFAULT_REFERENCE_WAV.resolve():
+            raise gr.Error(f"Default reference audio does not exist: {path}")
+        raise gr.Error(f"Reference audio does not exist: {path}")
+    if not path.is_file():
+        raise gr.Error(f"Reference audio must be a file: {path}")
+    return str(path)
 
 
 def _resolve_repo_path(value: str, label: str, must_exist: bool = True) -> str:
@@ -603,6 +624,466 @@ def _synthesize_original_subprocess(
     return str(preview_output), str(output), "\n".join(status_lines)
 
 
+def _timed_call(
+    model: Any,
+    timings: Optional[OrderedDict[str, float]],
+    name: str,
+    func: Any,
+) -> Any:
+    if timings is None:
+        return func()
+    model._sync_device()
+    started = time.perf_counter()
+    try:
+        return func()
+    finally:
+        model._sync_device()
+        timings[name] = timings.get(name, 0.0) + (time.perf_counter() - started)
+
+
+def _segment_token_length(model: Any, text: str, lang: str) -> int:
+    if lang == "zh":
+        return len(text)
+    return len(model.tokenizer.tokenize(model._format_text_prompt(text, lang)))
+
+
+def _segment_text_for_limit(
+    model: Any,
+    text: str,
+    lang: str,
+    max_tokens: int,
+    *,
+    strict: bool,
+) -> list[str]:
+    max_tokens = max(1, int(max_tokens))
+    kwargs = {
+        "tokenize_fn": lambda value: model.tokenizer.tokenize(
+            model._format_text_prompt(value, lang)
+        ),
+        "language": lang,
+        "max_tokens": max_tokens,
+    }
+    if strict:
+        kwargs.update({"min_tokens": 1, "merge_threshold": 0})
+    segments = model.normalizer.segment_text(text, **kwargs)
+    if not segments:
+        segments = [text]
+    return model._fit_segments_to_text_limit(segments, lang)
+
+
+def _remaining_text_after_first_segment(
+    text: str,
+    first_segment: str,
+    fallback_segments: list[str],
+) -> str:
+    text = text.strip()
+    first_segment = first_segment.strip()
+    if not first_segment:
+        return text
+
+    if text.startswith(first_segment):
+        return text[len(first_segment):].strip()
+
+    trimmed = first_segment.rstrip(" \t\r\n.,;:!?\"'")
+    if trimmed and text.startswith(trimmed):
+        return text[len(trimmed):].strip()
+
+    index = text.find(first_segment)
+    if index >= 0:
+        return text[index + len(first_segment):].strip()
+
+    if len(fallback_segments) > 1:
+        return " ".join(segment.strip() for segment in fallback_segments[1:] if segment.strip())
+    return ""
+
+
+def _split_first_segment_by_limit(
+    model: Any,
+    text: str,
+    lang: str,
+    max_tokens: int,
+) -> tuple[str, str]:
+    text = text.strip()
+    if not text:
+        return "", ""
+    if _segment_token_length(model, text, lang) <= max_tokens:
+        return text, ""
+
+    low = 1
+    high = len(text)
+    best = 0
+    while low <= high:
+        mid = (low + high) // 2
+        candidate = text[:mid].strip()
+        if candidate and _segment_token_length(model, candidate, lang) <= max_tokens:
+            best = mid
+            low = mid + 1
+        else:
+            high = mid - 1
+
+    cut = max(1, best)
+    punctuation = " \t\r\n.,;:!?"
+    min_cut = max(1, cut // 2)
+    for index in range(cut - 1, min_cut - 1, -1):
+        if text[index] in punctuation:
+            cut = index + 1
+            break
+
+    first = text[:cut].strip()
+    rest = text[cut:].strip()
+    return first, rest
+
+
+def _original_stream_segments(
+    model: Any,
+    text: str,
+    lang: str,
+    remaining_max_text_tokens: int,
+) -> list[str]:
+    first_limit = ORIGINAL_STREAM_FIRST_SEGMENT_TOKENS
+    first_pass_segments = _segment_text_for_limit(
+        model,
+        text,
+        lang,
+        first_limit,
+        strict=True,
+    )
+    first_segment = first_pass_segments[0].strip() if first_pass_segments else ""
+
+    if first_segment and _segment_token_length(model, first_segment, lang) <= first_limit:
+        rest_text = _remaining_text_after_first_segment(
+            text,
+            first_segment,
+            first_pass_segments,
+        )
+    else:
+        first_segment, rest_text = _split_first_segment_by_limit(
+            model,
+            text,
+            lang,
+            first_limit,
+        )
+
+    segments = [first_segment] if first_segment else []
+    if rest_text:
+        segments.extend(
+            _segment_text_for_limit(
+                model,
+                rest_text,
+                lang,
+                int(remaining_max_text_tokens),
+                strict=False,
+            )
+        )
+    if not segments:
+        segments = [text]
+    return segments
+
+
+def _stream_playback_chunk(
+    audio: torch.Tensor,
+    sample_rate: int,
+    cross_fade_duration: float,
+    *,
+    prepend_silence_and_fade_in: bool,
+    append_fade_out: bool,
+) -> torch.Tensor:
+    if audio.dim() == 1:
+        audio = audio.unsqueeze(0)
+    chunk = audio.detach().clone()
+    total_n = int(float(cross_fade_duration) * sample_rate)
+    fade_n = max(0, total_n // 3)
+    if fade_n <= 0 or chunk.shape[-1] == 0:
+        return chunk
+
+    if prepend_silence_and_fade_in:
+        fin_n = min(fade_n, chunk.shape[-1])
+        if fin_n > 0:
+            w_in = torch.linspace(0, 1, fin_n, device=chunk.device, dtype=chunk.dtype)
+            chunk[..., :fin_n] *= w_in
+        silence = torch.zeros(
+            chunk.shape[0],
+            fade_n,
+            device=chunk.device,
+            dtype=chunk.dtype,
+        )
+        chunk = torch.cat([silence, chunk], dim=-1)
+
+    if append_fade_out:
+        fout_n = min(fade_n, chunk.shape[-1])
+        if fout_n > 0:
+            w_out = torch.linspace(1, 0, fout_n, device=chunk.device, dtype=chunk.dtype)
+            chunk[..., -fout_n:] *= w_out
+    return chunk
+
+
+def _gradio_audio_chunk(audio: torch.Tensor, sample_rate: int) -> tuple[int, Any]:
+    audio_cpu = audio.detach().float().cpu()
+    if audio_cpu.dim() == 2:
+        if audio_cpu.shape[0] == 1:
+            data = audio_cpu.squeeze(0).numpy()
+        else:
+            data = audio_cpu.transpose(0, 1).numpy()
+    else:
+        data = audio_cpu.numpy()
+    return sample_rate, data
+
+
+def _save_wav_snapshot(
+    output: Path,
+    audio: torch.Tensor,
+    sample_rate: int,
+    model: Any,
+) -> float:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with (SERVE_POSTPROCESS_SEMAPHORE or nullcontext()):
+        started = time.perf_counter()
+        if SERVE_DETAILED_TIMINGS and torch.cuda.is_available() and model.device.type == "cuda":
+            torch.cuda.synchronize(model.device)
+        audio_cpu = audio.detach().float().cpu()
+        torchaudio.save(str(output), audio_cpu, sample_rate)
+        return time.perf_counter() - started
+
+
+def _format_original_stream_status(
+    *,
+    output: Path,
+    audio: torch.Tensor,
+    sample_rate: int,
+    completed_segments: int,
+    total_segments: int,
+    semantic_tokens: int,
+    max_text_tokens: int,
+    request_elapsed: float,
+    segment_elapsed: float,
+    save_elapsed: float,
+    target_duration_seconds: float,
+    segment_duration_targets: list[Optional[float]],
+    timings: Optional[OrderedDict[str, float]],
+) -> str:
+    generated_seconds = audio.shape[-1] / sample_rate
+    complete = completed_segments >= total_segments
+    verb = "streamed" if complete else "streaming"
+    lines = [
+        (
+            f"Original PyTorch T2S {verb} {completed_segments}/{total_segments} "
+            f"segment(s), {generated_seconds:.2f}s audio "
+            f"in {request_elapsed:.2f}s on {SERVE_DEVICE}."
+        ),
+        (
+            f"first_segment_token_limit={ORIGINAL_STREAM_FIRST_SEGMENT_TOKENS}, "
+            f"remaining_segment_token_limit={int(max_text_tokens)}, "
+            f"semantic_tokens={semantic_tokens}"
+        ),
+        f"wav={output}",
+        f"last_segment_generate={segment_elapsed:.3f}s",
+        f"save_wav={save_elapsed:.3f}s",
+    ]
+    if target_duration_seconds is not None and target_duration_seconds > 0:
+        lines.insert(
+            2,
+            (
+                f"target_duration={target_duration_seconds:.3f}s, "
+                f"delta={(generated_seconds - target_duration_seconds) * 1000:+.1f}ms"
+            ),
+        )
+    if any(duration is not None for duration in segment_duration_targets):
+        formatted_durations = [
+            None if duration is None else round(duration, 3)
+            for duration in segment_duration_targets
+        ]
+        lines.append(f"target_segment_durations={formatted_durations}")
+    if not complete:
+        lines.append("Generating the next segment; Stop original cancels the rest.")
+    if timings is not None:
+        lines.extend(["", "Timings:"])
+        for name, seconds in timings.items():
+            lines.append(f"{name}: {seconds:.3f}s")
+        lines.append(f"request_total: {request_elapsed:.3f}s")
+    return "\n".join(lines)
+
+
+def _synthesize_original_streaming(
+    prompt_wav: str,
+    text: str,
+    lang: str,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    num_beams: int,
+    repetition_penalty: float,
+    max_length: int,
+    diffusion_steps: int,
+    cfg_strength: float,
+    max_text_tokens: int,
+    target_duration_seconds: float,
+    target_segment_durations: str,
+    cross_fade_duration: float,
+    verbose: bool,
+) -> Iterator[tuple[Any, str, str]]:
+    from confuciustts.utils.audio_post import cross_fade_concat
+
+    model = _vllm_model()
+    timings: Optional[OrderedDict[str, float]] = (
+        OrderedDict() if SERVE_DETAILED_TIMINGS else None
+    )
+    if timings is not None:
+        model._sync_device()
+
+    target_segment_duration_values = _parse_duration_csv(target_segment_durations)
+    output = _output_path(prompt_wav, "pytorch-stream")
+    started = time.perf_counter()
+
+    with (SERVE_ORIGINAL_SEMAPHORE or nullcontext()):
+        with torch.inference_mode():
+            normalized_text = _timed_call(
+                model,
+                timings,
+                "normalize_text",
+                lambda: model.normalizer.normalize(text, language=lang),
+            )
+            if verbose:
+                print(f"[ConfuciusTTS] normalized text: {normalized_text}")
+
+            semantic_features, style_embedding, reference_mel = model._reference_conditioning(
+                prompt_wav,
+                timings,
+            )
+
+            segments = _timed_call(
+                model,
+                timings,
+                "segment_text",
+                lambda: _original_stream_segments(
+                    model,
+                    normalized_text,
+                    lang,
+                    int(max_text_tokens),
+                ),
+            )
+            try:
+                segment_duration_targets = model._segment_duration_targets(
+                    segments=segments,
+                    target_duration_seconds=float(target_duration_seconds or 0.0),
+                    target_segment_durations=target_segment_duration_values,
+                    cross_fade_duration=float(cross_fade_duration),
+                )
+            except ValueError as exc:
+                raise gr.Error(str(exc)) from exc
+
+            if verbose:
+                print(f"[ConfuciusTTS] streaming {len(segments)} original segment(s)")
+                for index, segment in enumerate(segments, start=1):
+                    print(f"[ConfuciusTTS] stream segment {index}/{len(segments)}: {segment!r}")
+
+            chunks: list[torch.Tensor] = []
+            semantic_token_total = 0
+            total_segments = len(segments)
+
+            for index, (segment, target_segment_duration) in enumerate(
+                zip(segments, segment_duration_targets),
+                start=1,
+            ):
+                segment_started = time.perf_counter()
+                audio, semantic_tokens = model._synth_segment(
+                    segment,
+                    lang,
+                    semantic_features,
+                    style_embedding,
+                    reference_mel,
+                    float(temperature),
+                    float(top_p),
+                    int(top_k),
+                    int(num_beams),
+                    float(repetition_penalty),
+                    int(max_length),
+                    int(diffusion_steps),
+                    float(cfg_strength),
+                    bool(verbose),
+                    target_duration_seconds=target_segment_duration,
+                    use_vllm=False,
+                    timings=timings,
+                )
+                segment_elapsed = time.perf_counter() - segment_started
+                semantic_token_total += semantic_tokens
+                if audio.dim() == 1:
+                    audio = audio.unsqueeze(0)
+                chunks.append(audio)
+
+                with _TimedMergeContext(model, timings):
+                    merged = cross_fade_concat(
+                        chunks,
+                        model.sample_rate,
+                        silence_duration=float(cross_fade_duration),
+                    )
+                    if (
+                        index == total_segments
+                        and target_duration_seconds is not None
+                        and target_duration_seconds > 0
+                    ):
+                        merged = model._fit_audio_to_duration(
+                            merged,
+                            float(target_duration_seconds),
+                        )
+
+                save_elapsed = _save_wav_snapshot(
+                    output,
+                    merged,
+                    model.sample_rate,
+                    model,
+                )
+                request_elapsed = time.perf_counter() - started
+                playback_chunk = _stream_playback_chunk(
+                    audio,
+                    model.sample_rate,
+                    float(cross_fade_duration),
+                    prepend_silence_and_fade_in=index > 1,
+                    append_fade_out=index < total_segments,
+                )
+                status = _format_original_stream_status(
+                    output=output,
+                    audio=merged,
+                    sample_rate=model.sample_rate,
+                    completed_segments=index,
+                    total_segments=total_segments,
+                    semantic_tokens=semantic_token_total,
+                    max_text_tokens=int(max_text_tokens),
+                    request_elapsed=request_elapsed,
+                    segment_elapsed=segment_elapsed,
+                    save_elapsed=save_elapsed,
+                    target_duration_seconds=float(target_duration_seconds or 0.0),
+                    segment_duration_targets=segment_duration_targets,
+                    timings=timings,
+                )
+                yield _gradio_audio_chunk(playback_chunk, model.sample_rate), str(output), status
+
+
+class _TimedMergeContext:
+    def __init__(
+        self,
+        model: Any,
+        timings: Optional[OrderedDict[str, float]],
+    ) -> None:
+        self.model = model
+        self.timings = timings
+        self.started = 0.0
+
+    def __enter__(self) -> "_TimedMergeContext":
+        if self.timings is not None:
+            self.model._sync_device()
+            self.started = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self.timings is not None:
+            self.model._sync_device()
+            self.timings["merge_segments"] = (
+                self.timings.get("merge_segments", 0.0)
+                + time.perf_counter()
+                - self.started
+            )
+
+
 def _synthesize(
     use_vllm: bool,
     prompt_wav: Optional[str],
@@ -623,10 +1104,7 @@ def _synthesize(
     cross_fade_duration: float,
     verbose: bool,
 ) -> tuple[str, str, str]:
-    if not prompt_wav:
-        raise gr.Error("Upload or record a reference audio file.")
-    if not Path(prompt_wav).exists():
-        raise gr.Error(f"Reference audio does not exist: {prompt_wav}")
+    prompt_wav = _reference_wav_or_default(prompt_wav)
 
     text = text.strip()
     if not text:
@@ -724,8 +1202,57 @@ def synthesize_vllm(*args: Any) -> tuple[str, str, str]:
     return _synthesize(True, *args)
 
 
-def synthesize_original(*args: Any) -> tuple[str, str, str]:
-    return _synthesize(False, *args)
+def synthesize_original(
+    prompt_wav: Optional[str],
+    text: str,
+    language: str,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    num_beams: int,
+    repetition_penalty: float,
+    max_length: int,
+    diffusion_steps: int,
+    cfg_strength: float,
+    max_text_tokens: int,
+    _segment_render_batch_size: int,
+    target_duration_seconds: float,
+    target_segment_durations: str,
+    cross_fade_duration: float,
+    verbose: bool,
+) -> Iterator[tuple[Any, str, str]]:
+    prompt_wav = _reference_wav_or_default(prompt_wav)
+
+    text = text.strip()
+    if not text:
+        raise gr.Error("Enter text to synthesize.")
+
+    lang = _language_code(language)
+    yield from _synthesize_original_streaming(
+        prompt_wav=prompt_wav,
+        text=text,
+        lang=lang,
+        temperature=float(temperature),
+        top_p=float(top_p),
+        top_k=int(top_k),
+        num_beams=int(num_beams),
+        repetition_penalty=float(repetition_penalty),
+        max_length=int(max_length),
+        diffusion_steps=int(diffusion_steps),
+        cfg_strength=float(cfg_strength),
+        max_text_tokens=int(max_text_tokens),
+        target_duration_seconds=float(target_duration_seconds or 0.0),
+        target_segment_durations=target_segment_durations,
+        cross_fade_duration=float(cross_fade_duration),
+        verbose=bool(verbose),
+    )
+
+
+def stop_original_generation() -> str:
+    return (
+        "Original generation stop requested. The current segment may finish, "
+        "but remaining queued segments are cancelled."
+    )
 
 
 def build_demo() -> gr.Blocks:
@@ -737,6 +1264,7 @@ def build_demo() -> gr.Blocks:
                 prompt_wav = gr.Audio(
                     label="Reference audio",
                     type="filepath",
+                    value=str(DEFAULT_REFERENCE_WAV),
                 )
                 language = gr.Dropdown(
                     label="Language",
@@ -754,6 +1282,7 @@ def build_demo() -> gr.Blocks:
                 with gr.Row():
                     generate_vllm_btn = gr.Button("Generate with vLLM", variant="primary")
                     generate_original_btn = gr.Button("Generate original")
+                    stop_original_btn = gr.Button("Stop original")
 
         with gr.Accordion("Generation settings", open=False):
             with gr.Row():
@@ -792,7 +1321,12 @@ def build_demo() -> gr.Blocks:
                 vllm_file = gr.File(label="Download vLLM WAV")
                 vllm_status = gr.Textbox(label="vLLM timing", interactive=False, lines=14)
             with gr.Column():
-                original_audio = gr.Audio(label="Original MP3 preview", type="filepath")
+                original_audio = gr.Audio(
+                    label="Original streaming preview",
+                    type="filepath",
+                    streaming=True,
+                    autoplay=True,
+                )
                 original_file = gr.File(label="Download original WAV")
                 original_status = gr.Textbox(label="Original timing", interactive=False, lines=14)
 
@@ -823,12 +1357,17 @@ def build_demo() -> gr.Blocks:
             ],
             outputs=[vllm_audio, vllm_file, vllm_status],
         )
-        generate_original_btn.click(
+        original_event = generate_original_btn.click(
             fn=synthesize_original,
             inputs=[
                 *generation_inputs,
             ],
             outputs=[original_audio, original_file, original_status],
+        )
+        stop_original_btn.click(
+            fn=stop_original_generation,
+            outputs=[original_status],
+            cancels=[original_event],
         )
 
     return demo
