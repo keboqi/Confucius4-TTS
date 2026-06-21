@@ -105,6 +105,162 @@ audio = model.generate(
 torchaudio.save("output.wav", audio.cpu(), model.sample_rate)
 ```
 
+### Gradio vLLM 服务
+
+启动本地 Gradio 界面。Gradio 入口点在启动时加载一个长时间运行的、基于 vLLM 的 T2S 引擎，并将其复用于 vLLM 请求。“Generate original” 按钮在一个独立的子进程中运行原始的 PyTorch 后端，因此它不会与 vLLM 引擎共享运行时状态：
+
+```bash
+sudo apt install ffmpeg
+pip install -r requirements.txt
+pip install --force-reinstall -r requirements-cu128.txt
+pip install -r requirements-vllm.txt
+pip install "numpy<2"
+pip install "https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
+pip install "torchcodec==0.9.*"
+
+python tools/convert_t2s_vllm.py \
+    --config config/inference_config.yaml \
+    --output checkpoints/t2s-vllm
+
+python gradio_app.py \
+    --server-name 0.0.0.0 \
+    --server-port 7860 \
+    --device cuda \
+    --config config/inference_config.yaml \
+    --vllm-model-dir checkpoints/t2s-vllm \
+    --vllm-gpu-memory-utilization 0.25 \
+    --concurrency-limit 100
+```
+
+### FastAPI vLLM 服务
+
+对于编程式客户端，请使用 FastAPI 服务。它复用了与 Gradio 服务相同的长时间运行的 vLLM 模型设置，但主 API 路径直接保存 WAV 输出，并跳过了仅用于 UI 的 MP3 预览：
+
+```bash
+bash scripts/run_fastapi_uv.sh
+```
+
+该脚本使用 `uv` 创建了一个独立的 `.venv-fastapi` 虚拟环境，安装与 Gradio 快速启动使用的相同的 CUDA 和 vLLM 软件栈，当缺失 `checkpoints/t2s-vllm` 时进行转换，然后在 `0.0.0.0:8000` 上启动 `fastapi_app.py`。启动预热默认在后台运行，因此模型加载完成后 HTTP 服务即可立即可用，同时服务器仍会为其后续的请求进行预热。这可以将后端 TTS 服务的依赖从主机 Python 环境中隔离出来。
+
+常见的环境变量覆盖项：
+
+```bash
+HOST=127.0.0.1 PORT=8010 VENV_DIR=.venv-confucius-api bash scripts/run_fastapi_uv.sh
+WARMUP=foreground bash scripts/run_fastapi_uv.sh
+WARMUP=0 bash scripts/run_fastapi_uv.sh
+CONVERT_VLLM=1 bash scripts/run_fastapi_uv.sh
+INSTALL_FFMPEG=0 INSTALL_FLASH_ATTN=0 bash scripts/run_fastapi_uv.sh --no-warmup
+```
+
+返回输出路径和下载 URL 的 JSON 响应：
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/tts \
+    -H "Content-Type: application/json" \
+    -d '{
+      "text": "Hello, this is a test of zero-shot voice cloning.",
+      "lang": "en"
+    }'
+```
+
+当省略或清空 `prompt_wav` 时，API 会使用 `resources/voice.mp3` 作为默认参考声音。API 默认返回 MP3，这与 Gradio 的预览输出相匹配。当客户端需要 WAV 文件时，请设置 `"output_format": "wav"`。
+FastAPI 预热默认使用与浏览器测试页面相同的文本，即 `Hello, this is a test of zero-shot voice cloning.`，并且 `GET /health` 会报告当前的预热状态。
+
+直接获取 MP3 响应：
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/tts/audio \
+    -H "Content-Type: application/json" \
+    -d '{"text":"Hello from the API.","lang":"en"}' \
+    --output output.mp3
+```
+
+直接获取 WAV 响应：
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/tts/audio \
+    -H "Content-Type: application/json" \
+    -d '{"text":"Hello from the API.","lang":"en","output_format":"wav"}' \
+    --output output.wav
+```
+
+上传带有 JSON 数据的参考音频文件：
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/tts/upload/audio \
+    -F 'payload={"text":"Hello with an uploaded voice.","lang":"en"}' \
+    -F prompt_wav=@resources/voice.mp3 \
+    --output output.mp3
+```
+
+生成的文件默认存储在 `outputs/api` 下。可以通过 `--output-dir` 或 `CONFUCIUS_API_OUTPUT_DIR` 覆盖它。该服务还暴露了用于浏览器测试的 `GET /ui`，`GET /health`，位于 `/docs` 的交互式文档，以及用于访问之前生成的 WAV 文件的 `GET /v1/audio/{file_name}`。
+
+优化的服务设置默认为：vLLM 使用自动 dtype 选择，S2A 在 CUDA 上自动使用降低精度计算，S2A 启用长度分桶（length bucketing），参考条件缓存 16 个音频提示，并且除非请求否则关闭同步的 CUDA 阶段计时。
+
+S2A diffusion 默认在 CUDA 上使用 `torch.compile`。这可以提高首次编译/预热后的重复生成吞吐量，但启动和首次请求将花费更长时间。使用 `--no-compile-s2a` 来禁用它。启动器还接受 IndexTTS 风格的别名 `--use-torch-compile`。
+Gradio 启动器默认在 `outputs/compile-cache/torchinductor` 下启用 PyTorch Inductor 的持久化 FX 图和 AOTAutograd 缓存，因此编译的 S2A 制品可以在服务重启后复用。通过 `--compile-cache-dir` 覆盖缓存位置或通过 `--no-compile-cache` 禁用该启动器默认行为。
+S2A 编译路径保持启用了 Inductor kernels，但禁用了 Inductor CUDA 图捕获（CUDA graph capture），因为依赖于提示音/文本的动态形状可能会导致创建过多的图形记录并在 Gradio 工作线程内失败。
+
+Gradio 服务也默认运行一次真正的启动生成，使用 `resources/voice.mp3` 和 `Hello, welcome to Confucius4-TTS.`。这在首个用户点击“Generate with vLLM”之前预热音频加载、参考条件、vLLM 请求路径、S2A 和 BigVGAN；如果您更倾向于快速的服务器启动而非快速的首次请求延迟，请使用 `--no-warmup`。可以使用 `--warmup-prompt-wav` 和 `--warmup-text` 覆盖预热参考音频或文本。
+
+S2A DiT 注意力机制使用 PyTorch SDPA。默认情况下 PyTorch 会选择后端，但您可以强制指定后端用于验证，如 `--s2a-sdpa-backend flash`、`efficient`、`math` 或 `cudnn`。S2A 数据类型默认为 `auto`，它会在支持的 CUDA 设备上选择 `bfloat16` 并在其他情况下回退到 `float32`；如果您需要以前的保守路径，请使用 `--s2a-dtype float32`。对于多段合成渲染，`--s2a-length-bucket-size` 默认为 `64`，以便将大小相近的 S2A 批处理进行分组并减少填充。使用 `--profile-cuda` 可将 S2A 和 BigVGAN 阶段的 torch 分析器跟踪写入 `outputs/profiles/`。
+
+BigVGAN 自动在 CUDA 上使用 NVIDIA 的融合 CUDA 激活核，这与 IndexTTS 的快速路径相匹配。使用 `--no-use-bigvgan-cuda-kernel` 将其禁用，或设置 `CONFUCIUS_USE_BIGVGAN_CUDA_KERNEL=0`。如果无法构建或加载该内核，Confucius 会回退到纯 torch 的 BigVGAN 实现。
+在 RTX PRO 6000 / Blackwell 上，随附的 BigVGAN 加载器会检测当前活动的 CUDA 设备并构建特定于架构的扩展，例如 `sm_120`，从而避免最新的 CUDA 工具链拒绝旧有的硬编码 `compute_70` 标志。
+
+目标时长以秒为单位指定，并且最终波形在采样精度级别拟合，因此保留了毫秒级的配音目标。S2A/声码器的渲染批大小默认为 `1`，这在目前的测试中是最快的；仍保留了更大的值用于实验。
+
+`requirements-vllm.txt` 也会以可编辑模式安装此仓库。这会将 Confucius 的自定义 T2S 模型注册为 `vllm.general_plugins` 入口点，这是必须的，因为 Gradio 服务使用的是生成的 vLLM 引擎工作进程。
+
+新的 vLLM 导出会将 T2S 前缀模块包含在 vLLM worker 内部。升级后请重新运行 `tools/convert_t2s_vllm.py` 以启用 `--vllm-prefix-mode auto`，避免在服务进程中构建大型前缀嵌入。旧的导出仍然有效，但会自动回退到 `embeds` 模式。
+
+如果安装的 vLLM 构建版本暴露了隐藏状态提取，vLLM 后端也可以避免重复的 PyTorch T2S transformer 潜层计算。默认的 `--vllm-latent-mode auto` 会尝试该路径，如果不支持则回退到 PyTorch 的潜层计算；使用 `--vllm-latent-mode pytorch` 保持先前的行为，或使用 `vllm` 强制使用新路径。
+
+非 vLLM 的 GPU 阶段受 `--gpu-stage-concurrency` 限制，因此 Wav2Vec2、CAMPPlus、S2A 和 BigVGAN 不会在大量 Gradio 请求中全部并发运行。参考条件通过音频内容哈希进行缓存；使用 `--reference-cache-size` 调整 LRU 大小。
+
+Gradio 不再默认请求同步每个阶段的 CUDA 耗时。仅在进行性能分析时使用 `--detailed-timings`；正常的服务会在不强制 `_StepTimer` CUDA 同步的情况下报告请求级延迟。
+
+默认情况下，vLLM 选择第一个兼容的注意力机制后端。在 Blackwell 架构上，这通常意味着首先选择 FlashInfer，然后是 FlashAttention，最后是 Triton。vLLM 需求固定了 `flashinfer-python` 版本。如果您明确需要测试 `FLASH_ATTN`，请从
+[mjun0812/flash-attention-prebuild-wheels](https://github.com/mjun0812/flash-attention-prebuild-wheels)
+使用匹配的预构建 wheel 包，而不是从源码构建 `flash-attn`。需将 wheel 包与部署环境的 Python、CUDA/PyTorch、CXX11 ABI 以及 Linux 平台相匹配。例如，带有 CUDA 13.0 `nvcc` 的 PyTorch `+cu128` 环境会导致 `pip install flash-attn` 回退至源码构建，并因 CUDA 版本不匹配而失败。
+
+为了强制指定测试使用的注意力机制后端，可添加以下参数之一：
+
+```bash
+--vllm-attention-backend FLASHINFER
+--vllm-attention-backend FLASH_ATTN
+```
+
+您可以通过以下命令验证 FlashInfer 是否安装成功：
+
+```bash
+flashinfer show-config
+```
+
+UI 界面接受参考音频文件、合成文本、语言选择以及高级生成设置。生成的 WAV 文件保存在 `outputs/gradio/` 目录下。
+
+为提升吞吐量，服务默认将 vLLM 设置为 `auto` dtype。如果部署环境需要以前保守的 T2S 精度路径，请使用 `--vllm-dtype float32`。
+
+### vLLM T2S 后端
+
+vLLM 路径加速了自回归的 Text2Semantic 阶段。参考音频编码、S2A diffusion 及 BigVGAN 仍在 PyTorch 中运行；S2A diffusion 可以通过 `torch.compile` 封装其 DiT 估计器，同时 BigVGAN 可以使用其融合的 CUDA 激活内核来加速声码器。这两种优化都在 CUDA 上默认启用。
+
+启动服务前需要转换后的 T2S 目录：
+
+```bash
+python tools/convert_t2s_vllm.py \
+    --config config/inference_config.yaml \
+    --output checkpoints/t2s-vllm
+```
+
+对于 API 服务器或 Gradio 队列，并发请求可以共享同一个 vLLM 引擎，因此语义解码由 vLLM 进行批处理。
+
+如果 `transformers` 在导入 `Wav2Vec2BertModel` 时失败并报错如 `operator torchvision::nms does not exist`，则说明 Python 环境中的 Torch/TorchVision 版本不匹配。请重新安装匹配的 CUDA 12.8 软件包系列：
+
+```bash
+pip install --force-reinstall torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+```
+
 ## 🚀 微调
 
 Confucius4-TTS 采用「语音编码器 + LLM」架构，训练流程涵盖以下两个模块：
