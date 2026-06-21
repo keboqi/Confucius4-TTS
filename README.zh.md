@@ -195,7 +195,7 @@ curl -X POST http://127.0.0.1:8000/v1/tts/upload/audio \
 
 生成的文件默认存储在 `outputs/api` 下。可以通过 `--output-dir` 或 `CONFUCIUS_API_OUTPUT_DIR` 覆盖它。该服务还暴露了用于浏览器测试的 `GET /ui`，`GET /health`，位于 `/docs` 的交互式文档，以及用于访问之前生成的 WAV 文件的 `GET /v1/audio/{file_name}`。
 
-优化的服务设置默认为：vLLM 使用自动 dtype 选择，S2A 在 CUDA 上自动使用降低精度计算，S2A 启用长度分桶（length bucketing），参考条件缓存 16 个音频提示，并且除非请求否则关闭同步的 CUDA 阶段计时。
+优化的服务设置默认为：vLLM 使用自动 dtype 选择，S2A 在 CUDA 上自动使用降低精度计算，S2A 启用长度分桶（length bucketing），参考条件缓存 100 个音频提示，并且除非请求否则关闭同步的 CUDA 阶段计时。
 
 S2A diffusion 默认在 CUDA 上使用 `torch.compile`。这可以提高首次编译/预热后的重复生成吞吐量，但启动和首次请求将花费更长时间。使用 `--no-compile-s2a` 来禁用它。启动器还接受 IndexTTS 风格的别名 `--use-torch-compile`。
 Gradio 启动器默认在 `outputs/compile-cache/torchinductor` 下启用 PyTorch Inductor 的持久化 FX 图和 AOTAutograd 缓存，因此编译的 S2A 制品可以在服务重启后复用。通过 `--compile-cache-dir` 覆盖缓存位置或通过 `--no-compile-cache` 禁用该启动器默认行为。

@@ -39,7 +39,7 @@ SERVE_VLLM_PREFIX_MODE = "auto"
 SERVE_VLLM_LATENT_MODE = "auto"
 SERVE_VLLM_HIDDEN_STATES_DIR: Optional[str] = None
 SERVE_GPU_STAGE_CONCURRENCY = 1
-SERVE_REFERENCE_CACHE_SIZE = 16
+SERVE_REFERENCE_CACHE_SIZE = 100
 SERVE_DETAILED_TIMINGS = False
 SERVE_POSTPROCESS_SEMAPHORE: Optional[threading.Semaphore] = None
 SERVE_STREAM_SEMAPHORE: Optional[threading.Semaphore] = None
@@ -1439,7 +1439,7 @@ def parse_args() -> argparse.Namespace:
                         default=int(os.getenv("CONFUCIUS_GPU_STAGE_CONCURRENCY", "1")),
                         help="Maximum concurrent non-vLLM GPU stages per process.")
     parser.add_argument("--reference-cache-size", type=int,
-                        default=int(os.getenv("CONFUCIUS_REFERENCE_CACHE_SIZE", "16")),
+                        default=int(os.getenv("CONFUCIUS_REFERENCE_CACHE_SIZE", "100")),
                         help="Number of reference-audio conditioning entries to cache per process.")
     parser.add_argument("--postprocess-concurrency", type=int,
                         default=int(os.getenv("CONFUCIUS_POSTPROCESS_CONCURRENCY", "2")),

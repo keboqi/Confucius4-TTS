@@ -225,7 +225,7 @@ with `--output-dir` or `CONFUCIUS_API_OUTPUT_DIR`. The service also exposes
 
 The optimized serving settings are defaults: vLLM uses automatic dtype
 selection, S2A uses automatic reduced precision on CUDA, S2A length bucketing is
-enabled, reference conditioning caches 16 audio prompts, and synchronized CUDA
+enabled, reference conditioning caches 100 audio prompts, and synchronized CUDA
 stage timings stay off unless requested.
 
 S2A diffusion uses `torch.compile` by default on CUDA. This can improve

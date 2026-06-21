@@ -136,7 +136,7 @@ class ApiSettings:
             profile_cuda=serving._env_bool("CONFUCIUS_PROFILE_CUDA", False),
             profile_dir=os.getenv("CONFUCIUS_PROFILE_DIR", "outputs/profiles"),
             gpu_stage_concurrency=int(os.getenv("CONFUCIUS_GPU_STAGE_CONCURRENCY", "1")),
-            reference_cache_size=int(os.getenv("CONFUCIUS_REFERENCE_CACHE_SIZE", "16")),
+            reference_cache_size=int(os.getenv("CONFUCIUS_REFERENCE_CACHE_SIZE", "100")),
             postprocess_concurrency=int(os.getenv("CONFUCIUS_POSTPROCESS_CONCURRENCY", "2")),
             inference_workers=int(os.getenv("CONFUCIUS_API_INFERENCE_WORKERS", "1")),
             detailed_timings=serving._env_bool("CONFUCIUS_DETAILED_TIMINGS", False),
