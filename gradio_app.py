@@ -42,8 +42,8 @@ SERVE_GPU_STAGE_CONCURRENCY = 1
 SERVE_REFERENCE_CACHE_SIZE = 16
 SERVE_DETAILED_TIMINGS = False
 SERVE_POSTPROCESS_SEMAPHORE: Optional[threading.Semaphore] = None
-SERVE_ORIGINAL_SEMAPHORE: Optional[threading.Semaphore] = None
-ORIGINAL_STREAM_FIRST_SEGMENT_TOKENS = 20
+SERVE_STREAM_SEMAPHORE: Optional[threading.Semaphore] = None
+VLLM_STREAM_FIRST_SEGMENT_TOKENS = 20
 
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
@@ -584,7 +584,7 @@ def _synthesize_original_subprocess(
         command.append("--verbose")
 
     started = time.perf_counter()
-    with (SERVE_ORIGINAL_SEMAPHORE or nullcontext()):
+    with (SERVE_STREAM_SEMAPHORE or nullcontext()):
         process = subprocess.run(
             command,
             cwd=str(ROOT_DIR),
@@ -734,13 +734,13 @@ def _split_first_segment_by_limit(
     return first, rest
 
 
-def _original_stream_segments(
+def _vllm_stream_segments(
     model: Any,
     text: str,
     lang: str,
     remaining_max_text_tokens: int,
 ) -> list[str]:
-    first_limit = ORIGINAL_STREAM_FIRST_SEGMENT_TOKENS
+    first_limit = VLLM_STREAM_FIRST_SEGMENT_TOKENS
     first_pass_segments = _segment_text_for_limit(
         model,
         text,
@@ -845,7 +845,7 @@ def _save_wav_snapshot(
         return time.perf_counter() - started
 
 
-def _format_original_stream_status(
+def _format_vllm_stream_status(
     *,
     output: Path,
     audio: torch.Tensor,
@@ -866,16 +866,16 @@ def _format_original_stream_status(
     verb = "streamed" if complete else "streaming"
     lines = [
         (
-            f"Original PyTorch T2S {verb} {completed_segments}/{total_segments} "
+            f"vLLM T2S {verb} {completed_segments}/{total_segments} "
             f"segment(s), {generated_seconds:.2f}s audio "
             f"in {request_elapsed:.2f}s on {SERVE_DEVICE}."
         ),
         (
-            f"first_segment_token_limit={ORIGINAL_STREAM_FIRST_SEGMENT_TOKENS}, "
+            f"first_segment_token_limit={VLLM_STREAM_FIRST_SEGMENT_TOKENS}, "
             f"remaining_segment_token_limit={int(max_text_tokens)}, "
             f"semantic_tokens={semantic_tokens}"
         ),
-        f"wav={output}",
+        f"{'wav' if complete else 'partial_wav'}={output}",
         f"last_segment_generate={segment_elapsed:.3f}s",
         f"save_wav={save_elapsed:.3f}s",
     ]
@@ -894,7 +894,7 @@ def _format_original_stream_status(
         ]
         lines.append(f"target_segment_durations={formatted_durations}")
     if not complete:
-        lines.append("Generating the next segment; Stop original cancels the rest.")
+        lines.append("Generating the next segment; Stop streaming cancels the rest.")
     if timings is not None:
         lines.extend(["", "Timings:"])
         for name, seconds in timings.items():
@@ -903,7 +903,7 @@ def _format_original_stream_status(
     return "\n".join(lines)
 
 
-def _synthesize_original_streaming(
+def _synthesize_vllm_streaming(
     prompt_wav: str,
     text: str,
     lang: str,
@@ -920,7 +920,7 @@ def _synthesize_original_streaming(
     target_segment_durations: str,
     cross_fade_duration: float,
     verbose: bool,
-) -> Iterator[tuple[Any, str, str]]:
+) -> Iterator[tuple[Any, Any, str]]:
     from confuciustts.utils.audio_post import cross_fade_concat
 
     model = _vllm_model()
@@ -931,10 +931,10 @@ def _synthesize_original_streaming(
         model._sync_device()
 
     target_segment_duration_values = _parse_duration_csv(target_segment_durations)
-    output = _output_path(prompt_wav, "pytorch-stream")
+    output = _output_path(prompt_wav, "vllm-stream")
     started = time.perf_counter()
 
-    with (SERVE_ORIGINAL_SEMAPHORE or nullcontext()):
+    with (SERVE_STREAM_SEMAPHORE or nullcontext()):
         with torch.inference_mode():
             normalized_text = _timed_call(
                 model,
@@ -954,7 +954,7 @@ def _synthesize_original_streaming(
                 model,
                 timings,
                 "segment_text",
-                lambda: _original_stream_segments(
+                lambda: _vllm_stream_segments(
                     model,
                     normalized_text,
                     lang,
@@ -972,7 +972,7 @@ def _synthesize_original_streaming(
                 raise gr.Error(str(exc)) from exc
 
             if verbose:
-                print(f"[ConfuciusTTS] streaming {len(segments)} original segment(s)")
+                print(f"[ConfuciusTTS] streaming {len(segments)} vLLM segment(s)")
                 for index, segment in enumerate(segments, start=1):
                     print(f"[ConfuciusTTS] stream segment {index}/{len(segments)}: {segment!r}")
 
@@ -1001,7 +1001,7 @@ def _synthesize_original_streaming(
                     float(cfg_strength),
                     bool(verbose),
                     target_duration_seconds=target_segment_duration,
-                    use_vllm=False,
+                    use_vllm=True,
                     timings=timings,
                 )
                 segment_elapsed = time.perf_counter() - segment_started
@@ -1040,7 +1040,7 @@ def _synthesize_original_streaming(
                     prepend_silence_and_fade_in=index > 1,
                     append_fade_out=index < total_segments,
                 )
-                status = _format_original_stream_status(
+                status = _format_vllm_stream_status(
                     output=output,
                     audio=merged,
                     sample_rate=model.sample_rate,
@@ -1055,7 +1055,8 @@ def _synthesize_original_streaming(
                     segment_duration_targets=segment_duration_targets,
                     timings=timings,
                 )
-                yield _gradio_audio_chunk(playback_chunk, model.sample_rate), str(output), status
+                file_update = str(output) if index == total_segments else gr.update()
+                yield _gradio_audio_chunk(playback_chunk, model.sample_rate), file_update, status
 
 
 class _TimedMergeContext:
@@ -1202,7 +1203,7 @@ def synthesize_vllm(*args: Any) -> tuple[str, str, str]:
     return _synthesize(True, *args)
 
 
-def synthesize_original(
+def synthesize_vllm_stream(
     prompt_wav: Optional[str],
     text: str,
     language: str,
@@ -1220,7 +1221,7 @@ def synthesize_original(
     target_segment_durations: str,
     cross_fade_duration: float,
     verbose: bool,
-) -> Iterator[tuple[Any, str, str]]:
+) -> Iterator[tuple[Any, Any, str]]:
     prompt_wav = _reference_wav_or_default(prompt_wav)
 
     text = text.strip()
@@ -1228,7 +1229,7 @@ def synthesize_original(
         raise gr.Error("Enter text to synthesize.")
 
     lang = _language_code(language)
-    yield from _synthesize_original_streaming(
+    yield from _synthesize_vllm_streaming(
         prompt_wav=prompt_wav,
         text=text,
         lang=lang,
@@ -1248,9 +1249,9 @@ def synthesize_original(
     )
 
 
-def stop_original_generation() -> str:
+def stop_vllm_stream() -> str:
     return (
-        "Original generation stop requested. The current segment may finish, "
+        "Streaming generation stop requested. The current segment may finish, "
         "but remaining queued segments are cancelled."
     )
 
@@ -1281,8 +1282,8 @@ def build_demo() -> gr.Blocks:
                 )
                 with gr.Row():
                     generate_vllm_btn = gr.Button("Generate with vLLM", variant="primary")
-                    generate_original_btn = gr.Button("Generate original")
-                    stop_original_btn = gr.Button("Stop original")
+                    generate_stream_btn = gr.Button("Stream with vLLM")
+                    stop_stream_btn = gr.Button("Stop stream")
 
         with gr.Accordion("Generation settings", open=False):
             with gr.Row():
@@ -1321,14 +1322,14 @@ def build_demo() -> gr.Blocks:
                 vllm_file = gr.File(label="Download vLLM WAV")
                 vllm_status = gr.Textbox(label="vLLM timing", interactive=False, lines=14)
             with gr.Column():
-                original_audio = gr.Audio(
-                    label="Original streaming preview",
-                    type="filepath",
+                stream_audio = gr.Audio(
+                    label="vLLM streaming preview",
+                    type="numpy",
                     streaming=True,
                     autoplay=True,
                 )
-                original_file = gr.File(label="Download original WAV")
-                original_status = gr.Textbox(label="Original timing", interactive=False, lines=14)
+                stream_file = gr.File(label="Download streamed WAV")
+                stream_status = gr.Textbox(label="vLLM streaming timing", interactive=False, lines=14)
 
         generation_inputs = [
             prompt_wav,
@@ -1357,17 +1358,17 @@ def build_demo() -> gr.Blocks:
             ],
             outputs=[vllm_audio, vllm_file, vllm_status],
         )
-        original_event = generate_original_btn.click(
-            fn=synthesize_original,
+        stream_event = generate_stream_btn.click(
+            fn=synthesize_vllm_stream,
             inputs=[
                 *generation_inputs,
             ],
-            outputs=[original_audio, original_file, original_status],
+            outputs=[stream_audio, stream_file, stream_status],
         )
-        stop_original_btn.click(
-            fn=stop_original_generation,
-            outputs=[original_status],
-            cancels=[original_event],
+        stop_stream_btn.click(
+            fn=stop_vllm_stream,
+            outputs=[stream_status],
+            cancels=[stream_event],
         )
 
     return demo
@@ -1468,7 +1469,7 @@ def main() -> None:
     global SERVE_PROFILE_CUDA, SERVE_PROFILE_DIR, SERVE_S2A_DTYPE
     global SERVE_S2A_LENGTH_BUCKET_SIZE, SERVE_S2A_SDPA_BACKEND
     global SERVE_DETAILED_TIMINGS, SERVE_GPU_STAGE_CONCURRENCY
-    global SERVE_ORIGINAL_SEMAPHORE
+    global SERVE_STREAM_SEMAPHORE
     global SERVE_POSTPROCESS_SEMAPHORE, SERVE_REFERENCE_CACHE_SIZE
     global SERVE_VLLM_HIDDEN_STATES_DIR, SERVE_VLLM_LATENT_MODE
     global SERVE_VLLM_PREFIX_MODE
@@ -1514,7 +1515,7 @@ def main() -> None:
     SERVE_REFERENCE_CACHE_SIZE = int(args.reference_cache_size)
     SERVE_DETAILED_TIMINGS = bool(args.detailed_timings)
     SERVE_POSTPROCESS_SEMAPHORE = threading.Semaphore(int(args.postprocess_concurrency))
-    SERVE_ORIGINAL_SEMAPHORE = threading.Semaphore(SERVE_GPU_STAGE_CONCURRENCY)
+    SERVE_STREAM_SEMAPHORE = threading.Semaphore(SERVE_GPU_STAGE_CONCURRENCY)
     compile_cache_dir = _configure_compile_cache(
         enabled=bool(args.compile_cache),
         cache_dir=args.compile_cache_dir,
