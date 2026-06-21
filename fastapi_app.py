@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import json
 import os
 import sys
 import threading
@@ -21,7 +22,7 @@ import torchaudio
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -586,6 +587,378 @@ def _health_payload() -> HealthResponse:
     )
 
 
+def _ui_html() -> str:
+    language_options = "\n".join(
+        f'<option value="{code}"{" selected" if code == "en" else ""}>{code}</option>'
+        for code in LANGUAGE_CODES
+    )
+    defaults = json.dumps(
+        {
+            "prompt_wav": DEFAULT_PROMPT_WAV,
+            "temperature": 0.8,
+            "top_p": 0.8,
+            "top_k": 30,
+            "num_beams": 3,
+            "repetition_penalty": 10.0,
+            "max_length": 1520,
+            "diffusion_steps": 10,
+            "cfg_strength": 0.7,
+            "max_text_tokens": 80,
+            "segment_render_batch_size": 1,
+            "target_duration_seconds": 0,
+            "cross_fade_duration": 0.3,
+        }
+    )
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Confucius4-TTS API Tester</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --border: #d7dce2;
+      --text: #17202a;
+      --muted: #5e6a78;
+      --accent: #2f6fed;
+      --accent-dark: #1f55bd;
+      --danger: #b42318;
+      --ok: #117047;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 14px;
+    }}
+    main {{
+      width: min(1180px, calc(100vw - 32px));
+      margin: 24px auto;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 360px;
+      gap: 16px;
+    }}
+    header {{
+      grid-column: 1 / -1;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }}
+    h1 {{
+      margin: 0;
+      font-size: 22px;
+      line-height: 1.2;
+      font-weight: 650;
+      letter-spacing: 0;
+    }}
+    a {{ color: var(--accent); text-decoration: none; }}
+    a:hover {{ text-decoration: underline; }}
+    section, aside {{
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+    }}
+    .grid {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }}
+    .wide {{ grid-column: 1 / -1; }}
+    label {{
+      display: grid;
+      gap: 6px;
+      min-width: 0;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+    }}
+    input, select, textarea, button {{
+      width: 100%;
+      min-width: 0;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      font: inherit;
+    }}
+    input, select, textarea {{
+      background: #fff;
+      color: var(--text);
+      padding: 9px 10px;
+    }}
+    textarea {{
+      min-height: 190px;
+      resize: vertical;
+      line-height: 1.45;
+    }}
+    input[type="file"] {{ padding: 7px; }}
+    details {{
+      margin-top: 14px;
+      border-top: 1px solid var(--border);
+      padding-top: 14px;
+    }}
+    summary {{
+      cursor: pointer;
+      color: var(--text);
+      font-weight: 650;
+      margin-bottom: 12px;
+    }}
+    .actions {{
+      display: flex;
+      gap: 10px;
+      margin-top: 14px;
+    }}
+    button {{
+      cursor: pointer;
+      padding: 10px 12px;
+      font-weight: 650;
+      background: #fff;
+      color: var(--text);
+    }}
+    button.primary {{
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }}
+    button.primary:hover {{ background: var(--accent-dark); }}
+    button:disabled {{ cursor: wait; opacity: 0.65; }}
+    .status {{
+      min-height: 46px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 10px;
+      color: var(--muted);
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }}
+    .status.ok {{ color: var(--ok); }}
+    .status.error {{ color: var(--danger); }}
+    audio {{
+      width: 100%;
+      margin-top: 12px;
+    }}
+    dl {{
+      display: grid;
+      grid-template-columns: 120px minmax(0, 1fr);
+      gap: 8px 10px;
+      margin: 14px 0 0;
+    }}
+    dt {{ color: var(--muted); font-weight: 650; }}
+    dd {{
+      margin: 0;
+      overflow-wrap: anywhere;
+    }}
+    pre {{
+      margin: 14px 0 0;
+      max-height: 280px;
+      overflow: auto;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: #f9fafb;
+      padding: 10px;
+      font-size: 12px;
+    }}
+    @media (max-width: 900px) {{
+      main {{ grid-template-columns: 1fr; }}
+      header {{ align-items: flex-start; flex-direction: column; }}
+    }}
+    @media (max-width: 620px) {{
+      main {{ width: min(100vw - 20px, 1180px); margin: 10px auto; }}
+      .grid {{ grid-template-columns: 1fr; }}
+      .wide {{ grid-column: auto; }}
+      .actions {{ flex-direction: column; }}
+      dl {{ grid-template-columns: 1fr; }}
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Confucius4-TTS API Tester</h1>
+      <nav><a href="/docs">Docs</a></nav>
+    </header>
+
+    <section>
+      <form id="tts-form">
+        <div class="grid">
+          <label class="wide">Text
+            <textarea id="text" required>Hello, this is a test of zero-shot voice cloning.</textarea>
+          </label>
+          <label>Language
+            <select id="lang">{language_options}</select>
+          </label>
+          <label>Server Reference
+            <input id="prompt_wav" value="{DEFAULT_PROMPT_WAV}">
+          </label>
+          <label class="wide">Upload Reference
+            <input id="prompt_file" type="file" accept="audio/*">
+          </label>
+        </div>
+
+        <details>
+          <summary>Generation Parameters</summary>
+          <div class="grid">
+            <label>Temperature <input id="temperature" type="number" step="0.05" min="0" value="0.8"></label>
+            <label>Top P <input id="top_p" type="number" step="0.05" min="0.01" max="1" value="0.8"></label>
+            <label>Top K <input id="top_k" type="number" step="1" min="0" value="30"></label>
+            <label>Beams <input id="num_beams" type="number" step="1" min="1" value="3"></label>
+            <label>Repetition Penalty <input id="repetition_penalty" type="number" step="0.1" min="0.1" value="10"></label>
+            <label>Max Length <input id="max_length" type="number" step="1" min="1" value="1520"></label>
+            <label>Diffusion Steps <input id="diffusion_steps" type="number" step="1" min="1" value="10"></label>
+            <label>CFG Strength <input id="cfg_strength" type="number" step="0.05" min="0" value="0.7"></label>
+            <label>Text Tokens <input id="max_text_tokens" type="number" step="1" min="1" value="80"></label>
+            <label>Render Batch <input id="segment_render_batch_size" type="number" step="1" min="1" value="1"></label>
+            <label>Target Seconds <input id="target_duration_seconds" type="number" step="0.1" min="0" value="0"></label>
+            <label>Cross Fade <input id="cross_fade_duration" type="number" step="0.05" min="0" value="0.3"></label>
+            <label class="wide">Segment Seconds
+              <input id="target_segment_durations" placeholder="1.2, 1.4, 1.1">
+            </label>
+          </div>
+        </details>
+
+        <div class="actions">
+          <button class="primary" id="generate" type="submit">Generate</button>
+          <button id="reset" type="button">Reset</button>
+        </div>
+      </form>
+    </section>
+
+    <aside>
+      <div id="status" class="status">Ready</div>
+      <audio id="audio" controls></audio>
+      <dl>
+        <dt>Request</dt><dd id="request-id">-</dd>
+        <dt>Duration</dt><dd id="duration">-</dd>
+        <dt>Elapsed</dt><dd id="elapsed">-</dd>
+        <dt>Download</dt><dd id="download">-</dd>
+      </dl>
+      <pre id="json">{{}}</pre>
+    </aside>
+  </main>
+
+  <script>
+    const defaults = {defaults};
+    const form = document.getElementById('tts-form');
+    const statusEl = document.getElementById('status');
+    const audioEl = document.getElementById('audio');
+    const jsonEl = document.getElementById('json');
+    const generateBtn = document.getElementById('generate');
+    const fields = [
+      'temperature', 'top_p', 'top_k', 'num_beams', 'repetition_penalty',
+      'max_length', 'diffusion_steps', 'cfg_strength', 'max_text_tokens',
+      'segment_render_batch_size', 'target_duration_seconds', 'cross_fade_duration'
+    ];
+
+    function setStatus(text, kind = '') {{
+      statusEl.className = 'status' + (kind ? ' ' + kind : '');
+      statusEl.textContent = text;
+    }}
+
+    function numberValue(id) {{
+      const value = document.getElementById(id).value;
+      return value === '' ? defaults[id] : Number(value);
+    }}
+
+    function payload() {{
+      const data = {{
+        text: document.getElementById('text').value,
+        lang: document.getElementById('lang').value,
+        prompt_wav: document.getElementById('prompt_wav').value || defaults.prompt_wav,
+      }};
+      for (const id of fields) data[id] = numberValue(id);
+      const segmentDurations = document.getElementById('target_segment_durations').value
+        .split(',')
+        .map((item) => item.trim())
+        .filter(Boolean)
+        .map(Number);
+      if (segmentDurations.length) data.target_segment_durations = segmentDurations;
+      return data;
+    }}
+
+    function renderResult(result) {{
+      const audioUrl = result.audio_url + '?t=' + Date.now();
+      audioEl.src = audioUrl;
+      document.getElementById('request-id').textContent = result.request_id || '-';
+      document.getElementById('duration').textContent = result.duration_seconds
+        ? result.duration_seconds.toFixed(2) + 's'
+        : '-';
+      document.getElementById('elapsed').textContent = result.elapsed_seconds
+        ? result.elapsed_seconds.toFixed(2) + 's'
+        : '-';
+      document.getElementById('download').innerHTML = result.audio_url
+        ? '<a href="' + result.audio_url + '">WAV</a>'
+        : '-';
+      jsonEl.textContent = JSON.stringify(result, null, 2);
+    }}
+
+    async function generate() {{
+      const data = payload();
+      const file = document.getElementById('prompt_file').files[0];
+      let response;
+      if (file) {{
+        const formData = new FormData();
+        formData.append('payload', JSON.stringify(data));
+        formData.append('prompt_wav', file);
+        response = await fetch('/v1/tts/upload', {{ method: 'POST', body: formData }});
+      }} else {{
+        response = await fetch('/v1/tts', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify(data),
+        }});
+      }}
+      const text = await response.text();
+      let result;
+      try {{
+        result = JSON.parse(text);
+      }} catch (_error) {{
+        throw new Error(text || response.statusText);
+      }}
+      if (!response.ok) {{
+        const detail = typeof result.detail === 'string'
+          ? result.detail
+          : JSON.stringify(result.detail || result);
+        throw new Error(detail);
+      }}
+      return result;
+    }}
+
+    form.addEventListener('submit', async (event) => {{
+      event.preventDefault();
+      generateBtn.disabled = true;
+      setStatus('Generating...');
+      try {{
+        const result = await generate();
+        renderResult(result);
+        setStatus('Complete', 'ok');
+      }} catch (error) {{
+        setStatus(error.message || String(error), 'error');
+      }} finally {{
+        generateBtn.disabled = false;
+      }}
+    }});
+
+    document.getElementById('reset').addEventListener('click', () => {{
+      form.reset();
+      document.getElementById('prompt_wav').value = defaults.prompt_wav;
+      audioEl.removeAttribute('src');
+      document.getElementById('request-id').textContent = '-';
+      document.getElementById('duration').textContent = '-';
+      document.getElementById('elapsed').textContent = '-';
+      document.getElementById('download').textContent = '-';
+      jsonEl.textContent = '{{}}';
+      setStatus('Ready');
+    }});
+  </script>
+</body>
+</html>"""
+
+
 def create_app(
     settings: Optional[ApiSettings] = None,
     *,
@@ -622,10 +995,15 @@ def create_app(
             "name": "Confucius4-TTS API",
             "version": API_VERSION,
             "health": "/health",
+            "ui": "/ui",
             "tts_json": "/v1/tts",
             "tts_audio": "/v1/tts/audio",
             "docs": "/docs",
         }
+
+    @app.get("/ui", response_class=HTMLResponse, tags=["meta"])
+    async def ui() -> HTMLResponse:
+        return HTMLResponse(_ui_html())
 
     @app.get("/health", response_model=HealthResponse, tags=["meta"])
     async def health() -> HealthResponse:

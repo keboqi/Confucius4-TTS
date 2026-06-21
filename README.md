@@ -207,8 +207,8 @@ curl -X POST http://127.0.0.1:8000/v1/tts/upload/audio \
 
 The generated files are stored under `outputs/api` by default. Override that
 with `--output-dir` or `CONFUCIUS_API_OUTPUT_DIR`. The service also exposes
-`GET /health`, interactive docs at `/docs`, and `GET /v1/audio/{file_name}` for
-previously generated WAV files.
+`GET /ui` for browser testing, `GET /health`, interactive docs at `/docs`, and
+`GET /v1/audio/{file_name}` for previously generated WAV files.
 
 The optimized serving settings are defaults: vLLM uses automatic dtype
 selection, S2A uses automatic reduced precision on CUDA, S2A length bucketing is
