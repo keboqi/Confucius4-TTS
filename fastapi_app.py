@@ -196,6 +196,9 @@ def _resolve_repo_dir_or_path(value: str) -> Path:
 def _configure_serving(settings: ApiSettings) -> None:
     global API_OUTPUT_DIR
 
+    if serving.SERVE_MODEL is not None:
+        return
+
     config_path = serving._resolve_repo_path(settings.config, "Config")
     vllm_model_dir = serving._resolve_repo_dir(settings.vllm_model_dir, "T2S vLLM directory")
     serve_device = serving._resolve_device(settings.device, probe_cuda=False)
@@ -300,23 +303,6 @@ def _configure_serving(settings: ApiSettings) -> None:
     )
     print("[Confucius4-TTS] FastAPI vLLM-backed TTS model is ready.", flush=True)
 
-    if settings.warmup:
-        if settings.warmup_mode == "foreground":
-            _run_startup_warmup(settings)
-        else:
-            print(
-                "[Confucius4-TTS] FastAPI startup warmup will run in the "
-                "background after the HTTP service starts.",
-                flush=True,
-            )
-    else:
-        print(
-            "[Confucius4-TTS] FastAPI startup warmup disabled; "
-            "the first synthesis request may be slower.",
-            flush=True,
-        )
-
-
 def _run_startup_warmup(settings: ApiSettings) -> None:
     print("[Confucius4-TTS] Running FastAPI startup warmup generation...", flush=True)
     warmup_started = time.perf_counter()
@@ -346,6 +332,25 @@ def _start_background_warmup(settings: ApiSettings) -> threading.Thread:
     )
     thread.start()
     return thread
+
+
+def _run_or_schedule_warmup(app: FastAPI, settings: ApiSettings) -> None:
+    if settings.warmup:
+        if settings.warmup_mode == "foreground":
+            _run_startup_warmup(settings)
+        else:
+            print(
+                "[Confucius4-TTS] FastAPI startup warmup will run in the "
+                "background after the HTTP service starts.",
+                flush=True,
+            )
+            app.state.warmup_thread = _start_background_warmup(settings)
+    else:
+        print(
+            "[Confucius4-TTS] FastAPI startup warmup disabled; "
+            "the first synthesis request may be slower.",
+            flush=True,
+        )
 
 
 def _model() -> Any:
@@ -577,14 +582,18 @@ def _health_payload() -> HealthResponse:
     )
 
 
-def create_app(settings: Optional[ApiSettings] = None) -> FastAPI:
+def create_app(
+    settings: Optional[ApiSettings] = None,
+    *,
+    load_model_in_lifespan: bool = True,
+) -> FastAPI:
     settings = settings or ApiSettings.from_env()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        _configure_serving(settings)
-        if settings.warmup and settings.warmup_mode == "background":
-            app.state.warmup_thread = _start_background_warmup(settings)
+        if load_model_in_lifespan:
+            _configure_serving(settings)
+        _run_or_schedule_warmup(app, settings)
         yield
 
     app = FastAPI(
@@ -788,7 +797,12 @@ def _settings_from_args(args: argparse.Namespace) -> ApiSettings:
 def main() -> None:
     args = parse_args()
     settings = _settings_from_args(args)
-    app_instance = create_app(settings)
+    # Match gradio_app.py startup ordering: initialize the vLLM-backed model
+    # before starting the web server event loop. Creating AsyncLLM inside
+    # Uvicorn's lifespan loop can leave the first vLLM generation waiting on
+    # the wrong async loop/thread.
+    _configure_serving(settings)
+    app_instance = create_app(settings, load_model_in_lifespan=False)
 
     import uvicorn
 

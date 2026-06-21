@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import json
 import os
@@ -85,6 +86,10 @@ class Text2SemanticVLLM:
         self.model_dir = str(Path(model_dir))
         self.SamplingParams = SamplingParams
         self._loop: Optional[_BackgroundLoop] = None
+        self.generate_timeout_seconds = _env_float(
+            "CONFUCIUS_VLLM_GENERATE_TIMEOUT_SECONDS",
+            120.0,
+        )
         self._model_config = _load_model_config(self.model_dir)
         self.prefix_mode = self._resolve_prefix_mode(prefix_mode)
         self.latent_mode = "pytorch"
@@ -501,10 +506,43 @@ class Text2SemanticVLLM:
         )
 
         final_output = None
-        async for output in output_generator:
-            final_output = output
+        started = asyncio.get_running_loop().time()
+        print(
+            "[ConfuciusTTS] Submitted vLLM T2S request "
+            f"id={request_id} max_tokens={max_tokens} prefix_len={prefix_len} "
+            f"timeout={self.generate_timeout_seconds or 'disabled'}s",
+            flush=True,
+        )
+        try:
+            while True:
+                try:
+                    if self.generate_timeout_seconds and self.generate_timeout_seconds > 0:
+                        output = await asyncio.wait_for(
+                            output_generator.__anext__(),
+                            timeout=float(self.generate_timeout_seconds),
+                        )
+                    else:
+                        output = await output_generator.__anext__()
+                except StopAsyncIteration:
+                    break
+                final_output = output
+        except asyncio.TimeoutError as exc:
+            await self._abort_request(request_id)
+            raise TimeoutError(
+                "vLLM T2S generation produced no output before timeout: "
+                f"request_id={request_id}, "
+                f"timeout={self.generate_timeout_seconds:.1f}s, "
+                f"max_tokens={max_tokens}, prefix_len={prefix_len}. "
+                "Set CONFUCIUS_VLLM_GENERATE_TIMEOUT_SECONDS=0 to disable this guard."
+            ) from exc
         if final_output is None:
             raise RuntimeError("vLLM returned no output for Confucius T2S generation.")
+        print(
+            "[ConfuciusTTS] Completed vLLM T2S request "
+            f"id={request_id} in {asyncio.get_running_loop().time() - started:.2f}s "
+            f"tokens={len(final_output.outputs[0].token_ids)}",
+            flush=True,
+        )
 
         raw_token_ids = list(final_output.outputs[0].token_ids)
         if eos in raw_token_ids:
@@ -560,6 +598,17 @@ class Text2SemanticVLLM:
         if self._loop is None:
             self._loop = _BackgroundLoop()
         return self._loop.run(self.async_generate_many(requests))
+
+    async def _abort_request(self, request_id: str) -> None:
+        for method_name in ("abort", "abort_request"):
+            method = getattr(self.llm, method_name, None)
+            if method is None:
+                continue
+            with contextlib.suppress(Exception):
+                result = method(request_id)
+                if inspect.isawaitable(result):
+                    await result
+                return
 
     @torch.no_grad()
     def _compute_latent(
@@ -763,6 +812,16 @@ def _load_model_config(model_dir: str) -> Dict[str, Any]:
             return json.load(file)
     except Exception:
         return {}
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a float.") from exc
 
 
 def _filter_kwargs(callable_obj: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
