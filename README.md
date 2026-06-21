@@ -145,6 +145,64 @@ python gradio_app.py \
     --concurrency-limit 100
 ```
 
+### FastAPI vLLM Service
+
+For programmatic clients, use the FastAPI service. It reuses the same
+long-lived vLLM-backed model setup as the Gradio service, but the main API path
+saves WAV output directly and skips the UI-only MP3 preview:
+
+```bash
+bash scripts/run_fastapi_uv.sh
+```
+
+The script creates an isolated `.venv-fastapi` with `uv`, installs the same CUDA
+and vLLM stack used by the Gradio quick start, converts `checkpoints/t2s-vllm`
+when it is missing, then starts `fastapi_app.py` on `0.0.0.0:8000`. This keeps
+the backend TTS service dependencies out of the host Python environment.
+
+Common overrides:
+
+```bash
+HOST=127.0.0.1 PORT=8010 VENV_DIR=.venv-confucius-api bash scripts/run_fastapi_uv.sh
+CONVERT_VLLM=1 bash scripts/run_fastapi_uv.sh
+INSTALL_FFMPEG=0 INSTALL_FLASH_ATTN=0 bash scripts/run_fastapi_uv.sh --no-warmup
+```
+
+JSON response with an output path and download URL:
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/tts \
+    -H "Content-Type: application/json" \
+    -d '{
+      "text": "Hello, this is a test of zero-shot voice cloning.",
+      "lang": "en",
+      "prompt_wav": "resources/voice.mp3"
+    }'
+```
+
+Direct WAV response:
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/tts/audio \
+    -H "Content-Type: application/json" \
+    -d '{"text":"Hello from the API.","lang":"en"}' \
+    --output output.wav
+```
+
+Upload a reference audio file with a JSON payload:
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/tts/upload/audio \
+    -F 'payload={"text":"Hello with an uploaded voice.","lang":"en"}' \
+    -F prompt_wav=@resources/voice.mp3 \
+    --output output.wav
+```
+
+The generated files are stored under `outputs/api` by default. Override that
+with `--output-dir` or `CONFUCIUS_API_OUTPUT_DIR`. The service also exposes
+`GET /health`, interactive docs at `/docs`, and `GET /v1/audio/{file_name}` for
+previously generated WAV files.
+
 The optimized serving settings are defaults: vLLM uses automatic dtype
 selection, S2A uses automatic reduced precision on CUDA, S2A length bucketing is
 enabled, reference conditioning caches 16 audio prompts, and synchronized CUDA

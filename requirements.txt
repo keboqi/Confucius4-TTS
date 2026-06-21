@@ -43,3 +43,6 @@ fsspec==2026.2.0
 # vLLM 0.16.x and current HF/gRPC stacks need protobuf 5.x.
 protobuf>=5.29.6,<6.0.0
 gradio>=4.44.1
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.20
