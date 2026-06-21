@@ -264,11 +264,57 @@ def _warmup_serving_model(
     lang: str,
     diffusion_steps: int,
     cfg_strength: float,
+    extra_text: Optional[str] = None,
 ) -> bool:
-    text = (text or "Hello, welcome to Confucius4-TTS.").strip()
+    texts = _warmup_text_sequence(text, extra_text)
+    if not texts:
+        texts = ["Hello, welcome to Confucius4-TTS."]
     lang = (lang or "en").strip()
     diffusion_steps = max(1, int(diffusion_steps))
 
+    success = True
+    total = len(texts)
+    for index, warmup_text in enumerate(texts, start=1):
+        label = "Startup UI warmup"
+        if total > 1:
+            label = f"{label} {index}/{total}"
+        success = (
+            _run_vllm_ui_warmup(
+                model,
+                prompt_wav=prompt_wav,
+                text=warmup_text,
+                lang=lang,
+                diffusion_steps=diffusion_steps,
+                cfg_strength=cfg_strength,
+                label=label,
+            )
+            and success
+        )
+    return success
+
+
+def _warmup_text_sequence(
+    text: Optional[str],
+    extra_text: Optional[str],
+) -> list[str]:
+    texts: list[str] = []
+    for value in (text, extra_text):
+        normalized = (value or "").strip()
+        if normalized and normalized not in texts:
+            texts.append(normalized)
+    return texts
+
+
+def _run_vllm_ui_warmup(
+    model: Any,
+    *,
+    prompt_wav: str,
+    text: str,
+    lang: str,
+    diffusion_steps: int,
+    cfg_strength: float,
+    label: str,
+) -> bool:
     started = time.perf_counter()
     warmup_outputs: list[Path] = []
     try:
@@ -301,7 +347,7 @@ def _warmup_serving_model(
     except Exception:
         traceback.print_exc()
         print(
-            "[Confucius4-TTS] Startup warmup failed; continuing without a "
+            f"[Confucius4-TTS] {label} failed; continuing without a "
             "prewarmed first request.",
             flush=True,
         )
@@ -314,7 +360,7 @@ def _warmup_serving_model(
                 pass
 
     print(
-        "[Confucius4-TTS] Startup UI warmup completed in "
+        f"[Confucius4-TTS] {label} completed in "
         f"{time.perf_counter() - started:.2f}s "
         f"(prompt_wav={prompt_wav}).",
         flush=True,
@@ -1373,6 +1419,12 @@ def parse_args() -> argparse.Namespace:
                         default=os.getenv("CONFUCIUS_WARMUP_PROMPT_WAV", "resources/voice.mp3"),
                         help="Reference audio used for startup warmup generation.")
     parser.add_argument("--warmup-text", default=os.getenv("CONFUCIUS_WARMUP_TEXT", "Hello, welcome to Confucius4-TTS."))
+    parser.add_argument("--warmup-extra-text",
+                        default=os.getenv(
+                            "CONFUCIUS_WARMUP_EXTRA_TEXT",
+                            "this is the second warmup.",
+                        ),
+                        help="Optional second warmup prompt used to prewarm another short generation shape.")
     parser.add_argument("--warmup-lang", default=os.getenv("CONFUCIUS_WARMUP_LANG", "en"),
                         choices=[_language_code(choice) for choice in LANGUAGE_CHOICES])
     parser.add_argument("--warmup-diffusion-steps", type=int,
@@ -1511,6 +1563,7 @@ def main() -> None:
             lang=args.warmup_lang,
             diffusion_steps=args.warmup_diffusion_steps,
             cfg_strength=0.7,
+            extra_text=_normalize_optional_text(args.warmup_extra_text),
         )
 
     launch_kwargs = {
