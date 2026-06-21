@@ -4,7 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
+import concurrent.futures
+import contextlib
+import functools
 import json
 import os
 import sys
@@ -20,7 +24,6 @@ from typing import Any, Optional
 import torch
 import torchaudio
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
@@ -33,8 +36,13 @@ import gradio_app as serving
 
 API_VERSION = "0.1.0"
 DEFAULT_PROMPT_WAV = "resources/voice.mp3"
+DEFAULT_UI_TEXT = "Hello, this is a test of zero-shot voice cloning."
 DEFAULT_OUTPUT_DIR = ROOT_DIR / "outputs" / "api"
 API_OUTPUT_DIR = DEFAULT_OUTPUT_DIR
+WARMUP_STATUS = "not_started"
+WARMUP_LAST_ERROR: Optional[str] = None
+WARMUP_LOCK = threading.Lock()
+INFERENCE_EXECUTOR: Optional[concurrent.futures.ThreadPoolExecutor] = None
 REFERENCE_UPLOAD_SUFFIXES = {".wav", ".mp3", ".flac", ".m4a", ".ogg", ".aac"}
 LANGUAGE_CODES = tuple(
     serving._language_code(choice) for choice in serving.LANGUAGE_CHOICES
@@ -73,6 +81,7 @@ class ApiSettings:
     gpu_stage_concurrency: int
     reference_cache_size: int
     postprocess_concurrency: int
+    inference_workers: int
     detailed_timings: bool
     output_dir: str
     cors_origins: tuple[str, ...]
@@ -116,7 +125,7 @@ class ApiSettings:
             warmup_prompt_wav=os.getenv("CONFUCIUS_WARMUP_PROMPT_WAV", "resources/voice.mp3"),
             warmup_text=os.getenv(
                 "CONFUCIUS_WARMUP_TEXT",
-                "Hello, welcome to Confucius4-TTS.",
+                DEFAULT_UI_TEXT,
             ),
             warmup_extra_text=os.getenv(
                 "CONFUCIUS_WARMUP_EXTRA_TEXT",
@@ -129,6 +138,7 @@ class ApiSettings:
             gpu_stage_concurrency=int(os.getenv("CONFUCIUS_GPU_STAGE_CONCURRENCY", "1")),
             reference_cache_size=int(os.getenv("CONFUCIUS_REFERENCE_CACHE_SIZE", "16")),
             postprocess_concurrency=int(os.getenv("CONFUCIUS_POSTPROCESS_CONCURRENCY", "2")),
+            inference_workers=int(os.getenv("CONFUCIUS_API_INFERENCE_WORKERS", "1")),
             detailed_timings=serving._env_bool("CONFUCIUS_DETAILED_TIMINGS", False),
             output_dir=os.getenv("CONFUCIUS_API_OUTPUT_DIR", "outputs/api"),
             cors_origins=_parse_cors_origins(os.getenv("CONFUCIUS_API_CORS_ORIGINS", "")),
@@ -192,6 +202,8 @@ class HealthResponse(BaseModel):
     sample_rate: Optional[int]
     vllm_loaded: bool
     output_dir: str
+    warmup_status: str
+    warmup_last_error: Optional[str]
 
 
 def _parse_cors_origins(value: str) -> tuple[str, ...]:
@@ -209,6 +221,7 @@ def _configure_serving(settings: ApiSettings) -> None:
     global API_OUTPUT_DIR
 
     if serving.SERVE_MODEL is not None:
+        _ensure_inference_executor(settings.inference_workers)
         return
 
     config_path = serving._resolve_repo_path(settings.config, "Config")
@@ -231,10 +244,13 @@ def _configure_serving(settings: ApiSettings) -> None:
         raise ValueError("--reference-cache-size must be zero or greater.")
     if settings.postprocess_concurrency < 1:
         raise ValueError("--postprocess-concurrency must be at least 1.")
+    if settings.inference_workers < 1:
+        raise ValueError("--inference-workers must be at least 1.")
 
     API_OUTPUT_DIR = _resolve_repo_dir_or_path(settings.output_dir)
     API_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     serving.OUTPUT_DIR = API_OUTPUT_DIR
+    _ensure_inference_executor(settings.inference_workers)
 
     t2s_checkpoint = serving._normalize_checkpoint(settings.t2s_checkpoint)
     vllm_attention_backend = serving._normalize_optional_text(settings.vllm_attention_backend)
@@ -315,49 +331,123 @@ def _configure_serving(settings: ApiSettings) -> None:
     )
     print("[Confucius4-TTS] FastAPI vLLM-backed TTS model is ready.", flush=True)
 
-def _run_startup_warmup(settings: ApiSettings) -> None:
-    print("[Confucius4-TTS] Running FastAPI startup warmup generation...", flush=True)
-    warmup_started = time.perf_counter()
-    warmup_ok = serving._warmup_serving_model(
-        serving.SERVE_MODEL,
-        prompt_wav=settings.warmup_prompt_wav,
-        text=settings.warmup_text,
-        lang=settings.warmup_lang,
-        diffusion_steps=settings.warmup_diffusion_steps,
-        cfg_strength=0.7,
-        extra_text=serving._normalize_optional_text(settings.warmup_extra_text),
+
+def _ensure_inference_executor(max_workers: int) -> concurrent.futures.ThreadPoolExecutor:
+    global INFERENCE_EXECUTOR
+
+    if INFERENCE_EXECUTOR is None:
+        INFERENCE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, int(max_workers)),
+            thread_name_prefix="confucius-fastapi-infer",
+        )
+    return INFERENCE_EXECUTOR
+
+
+async def _run_inference(func: Any, *args: Any, **kwargs: Any) -> Any:
+    if INFERENCE_EXECUTOR is None:
+        raise RuntimeError("The FastAPI inference executor is not initialized.")
+    loop = asyncio.get_running_loop()
+    call = functools.partial(func, *args, **kwargs)
+    return await loop.run_in_executor(INFERENCE_EXECUTOR, call)
+
+
+def _shutdown_inference_executor() -> None:
+    global INFERENCE_EXECUTOR
+
+    if INFERENCE_EXECUTOR is not None:
+        INFERENCE_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+        INFERENCE_EXECUTOR = None
+
+
+def _warmup_requests(settings: ApiSettings) -> list[TTSRequest]:
+    texts: list[str] = []
+    for value in (settings.warmup_text, settings.warmup_extra_text):
+        normalized = (value or "").strip()
+        if normalized and normalized not in texts:
+            texts.append(normalized)
+    if not texts:
+        texts = [DEFAULT_UI_TEXT]
+
+    return [
+        TTSRequest(
+            text=text,
+            lang=settings.warmup_lang,
+            prompt_wav=settings.warmup_prompt_wav,
+            diffusion_steps=settings.warmup_diffusion_steps,
+            cfg_strength=0.7,
+            output_format="mp3",
+        )
+        for text in texts
+    ]
+
+
+def _delete_warmup_outputs(response: TTSResponse) -> None:
+    for path in {response.audio_path, response.wav_path}:
+        with contextlib.suppress(Exception):
+            Path(path).unlink(missing_ok=True)
+
+
+async def _run_startup_warmup(settings: ApiSettings) -> None:
+    global WARMUP_LAST_ERROR, WARMUP_STATUS
+
+    requests = _warmup_requests(settings)
+    print(
+        "[Confucius4-TTS] Running FastAPI startup warmup generation "
+        f"through the API path ({len(requests)} request(s))...",
+        flush=True,
     )
-    warmup_status = "completed" if warmup_ok else "finished with errors"
+    with WARMUP_LOCK:
+        WARMUP_STATUS = "running"
+        WARMUP_LAST_ERROR = None
+    warmup_started = time.perf_counter()
+    try:
+        for index, request in enumerate(requests, start=1):
+            print(
+                "[Confucius4-TTS] FastAPI warmup "
+                f"{index}/{len(requests)} text={request.text!r}",
+                flush=True,
+            )
+            response = await _run_inference(_synthesize_sync, request)
+            _delete_warmup_outputs(response)
+    except Exception as exc:
+        traceback.print_exc()
+        with WARMUP_LOCK:
+            WARMUP_STATUS = "failed"
+            WARMUP_LAST_ERROR = str(exc)
+        print(
+            "[Confucius4-TTS] FastAPI startup warmup failed in "
+            f"{time.perf_counter() - warmup_started:.2f}s: {exc}",
+            flush=True,
+        )
+        return
+    with WARMUP_LOCK:
+        WARMUP_STATUS = "completed"
+        WARMUP_LAST_ERROR = None
     print(
         "[Confucius4-TTS] FastAPI startup warmup "
-        f"{warmup_status} in {time.perf_counter() - warmup_started:.2f}s.",
+        f"completed in {time.perf_counter() - warmup_started:.2f}s.",
         flush=True,
     )
 
 
-def _start_background_warmup(settings: ApiSettings) -> threading.Thread:
-    thread = threading.Thread(
-        target=_run_startup_warmup,
-        args=(settings,),
-        name="confucius-fastapi-warmup",
-        daemon=True,
-    )
-    thread.start()
-    return thread
+async def _run_or_schedule_warmup(app: FastAPI, settings: ApiSettings) -> None:
+    global WARMUP_STATUS
 
-
-def _run_or_schedule_warmup(app: FastAPI, settings: ApiSettings) -> None:
     if settings.warmup:
         if settings.warmup_mode == "foreground":
-            _run_startup_warmup(settings)
+            await _run_startup_warmup(settings)
         else:
+            with WARMUP_LOCK:
+                WARMUP_STATUS = "scheduled"
             print(
                 "[Confucius4-TTS] FastAPI startup warmup will run in the "
                 "background after the HTTP service starts.",
                 flush=True,
             )
-            app.state.warmup_thread = _start_background_warmup(settings)
+            app.state.warmup_task = asyncio.create_task(_run_startup_warmup(settings))
     else:
+        with WARMUP_LOCK:
+            WARMUP_STATUS = "disabled"
         print(
             "[Confucius4-TTS] FastAPI startup warmup disabled; "
             "the first synthesis request may be slower.",
@@ -547,7 +637,7 @@ async def _run_synthesis(
     prompt_wav_override: Optional[str] = None,
 ) -> TTSResponse:
     try:
-        return await run_in_threadpool(
+        return await _run_inference(
             _synthesize_sync,
             request,
             prompt_wav_override=prompt_wav_override,
@@ -608,6 +698,9 @@ async def _save_uploaded_reference(upload: UploadFile) -> str:
 
 def _health_payload() -> HealthResponse:
     model = serving.SERVE_MODEL
+    with WARMUP_LOCK:
+        warmup_status = WARMUP_STATUS
+        warmup_last_error = WARMUP_LAST_ERROR
     return HealthResponse(
         status="ok" if model is not None else "starting",
         version=API_VERSION,
@@ -616,6 +709,8 @@ def _health_payload() -> HealthResponse:
         sample_rate=None if model is None else int(model.sample_rate),
         vllm_loaded=bool(model is not None and getattr(model, "t2s_vllm", None) is not None),
         output_dir=str(API_OUTPUT_DIR),
+        warmup_status=warmup_status,
+        warmup_last_error=warmup_last_error,
     )
 
 
@@ -820,7 +915,7 @@ def _ui_html() -> str:
       <form id="tts-form" novalidate>
         <div class="grid">
           <label class="wide">Text
-            <textarea id="text" required>Hello, this is a test of zero-shot voice cloning.</textarea>
+            <textarea id="text" required>{DEFAULT_UI_TEXT}</textarea>
           </label>
           <label>Language
             <select id="lang">{language_options}</select>
@@ -1011,8 +1106,14 @@ def create_app(
     async def lifespan(app: FastAPI):
         if load_model_in_lifespan:
             _configure_serving(settings)
-        _run_or_schedule_warmup(app, settings)
-        yield
+        await _run_or_schedule_warmup(app, settings)
+        try:
+            yield
+        finally:
+            warmup_task = getattr(app.state, "warmup_task", None)
+            if warmup_task is not None and not warmup_task.done():
+                warmup_task.cancel()
+            _shutdown_inference_executor()
 
     app = FastAPI(
         title="Confucius4-TTS API",
@@ -1186,6 +1287,9 @@ def parse_args() -> argparse.Namespace:
                         default=defaults.reference_cache_size)
     parser.add_argument("--postprocess-concurrency", type=int,
                         default=defaults.postprocess_concurrency)
+    parser.add_argument("--inference-workers", type=int,
+                        default=defaults.inference_workers,
+                        help="Dedicated FastAPI inference worker threads. Default 1 keeps warmup and requests on the same thread.")
     parser.add_argument("--detailed-timings", action=argparse.BooleanOptionalAction,
                         default=defaults.detailed_timings)
     return parser.parse_args()
@@ -1223,6 +1327,7 @@ def _settings_from_args(args: argparse.Namespace) -> ApiSettings:
         gpu_stage_concurrency=args.gpu_stage_concurrency,
         reference_cache_size=args.reference_cache_size,
         postprocess_concurrency=args.postprocess_concurrency,
+        inference_workers=args.inference_workers,
         detailed_timings=args.detailed_timings,
         output_dir=args.output_dir,
         cors_origins=tuple(args.cors_origins or ()),

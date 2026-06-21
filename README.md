@@ -187,6 +187,9 @@ curl -X POST http://127.0.0.1:8000/v1/tts \
 When `prompt_wav` is omitted or empty, the API uses `resources/voice.mp3` as the
 default reference voice. The API returns MP3 by default, matching the Gradio
 preview output. Set `"output_format": "wav"` when a client needs the WAV file.
+The FastAPI warmup default uses the same text as the browser tester,
+`Hello, this is a test of zero-shot voice cloning.`, and `GET /health` reports
+the current warmup status.
 
 Direct MP3 response:
 
