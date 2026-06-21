@@ -784,7 +784,7 @@ def _ui_html() -> str:
     </header>
 
     <section>
-      <form id="tts-form">
+      <form id="tts-form" novalidate>
         <div class="grid">
           <label class="wide">Text
             <textarea id="text" required>Hello, this is a test of zero-shot voice cloning.</textarea>
@@ -804,7 +804,7 @@ def _ui_html() -> str:
           <summary>Generation Parameters</summary>
           <div class="grid">
             <label>Temperature <input id="temperature" type="number" step="0.05" min="0" value="0.8"></label>
-            <label>Top P <input id="top_p" type="number" step="0.05" min="0.01" max="1" value="0.8"></label>
+            <label>Top P <input id="top_p" type="number" step="0.01" min="0" max="1" value="0.8"></label>
             <label>Top K <input id="top_k" type="number" step="1" min="0" value="30"></label>
             <label>Beams <input id="num_beams" type="number" step="1" min="1" value="3"></label>
             <label>Repetition Penalty <input id="repetition_penalty" type="number" step="0.1" min="0.1" value="10"></label>
