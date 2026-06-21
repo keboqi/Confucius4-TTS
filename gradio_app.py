@@ -43,7 +43,8 @@ SERVE_REFERENCE_CACHE_SIZE = 16
 SERVE_DETAILED_TIMINGS = False
 SERVE_POSTPROCESS_SEMAPHORE: Optional[threading.Semaphore] = None
 SERVE_STREAM_SEMAPHORE: Optional[threading.Semaphore] = None
-VLLM_STREAM_FIRST_SEGMENT_TOKENS = 20
+STREAM_GENERATION_LOCK = threading.Lock()
+STREAM_GENERATION_ID = 0
 
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
@@ -641,12 +642,6 @@ def _timed_call(
         timings[name] = timings.get(name, 0.0) + (time.perf_counter() - started)
 
 
-def _segment_token_length(model: Any, text: str, lang: str) -> int:
-    if lang == "zh":
-        return len(text)
-    return len(model.tokenizer.tokenize(model._format_text_prompt(text, lang)))
-
-
 def _segment_text_for_limit(
     model: Any,
     text: str,
@@ -671,113 +666,19 @@ def _segment_text_for_limit(
     return model._fit_segments_to_text_limit(segments, lang)
 
 
-def _remaining_text_after_first_segment(
-    text: str,
-    first_segment: str,
-    fallback_segments: list[str],
-) -> str:
-    text = text.strip()
-    first_segment = first_segment.strip()
-    if not first_segment:
-        return text
-
-    if text.startswith(first_segment):
-        return text[len(first_segment):].strip()
-
-    trimmed = first_segment.rstrip(" \t\r\n.,;:!?\"'")
-    if trimmed and text.startswith(trimmed):
-        return text[len(trimmed):].strip()
-
-    index = text.find(first_segment)
-    if index >= 0:
-        return text[index + len(first_segment):].strip()
-
-    if len(fallback_segments) > 1:
-        return " ".join(segment.strip() for segment in fallback_segments[1:] if segment.strip())
-    return ""
-
-
-def _split_first_segment_by_limit(
-    model: Any,
-    text: str,
-    lang: str,
-    max_tokens: int,
-) -> tuple[str, str]:
-    text = text.strip()
-    if not text:
-        return "", ""
-    if _segment_token_length(model, text, lang) <= max_tokens:
-        return text, ""
-
-    low = 1
-    high = len(text)
-    best = 0
-    while low <= high:
-        mid = (low + high) // 2
-        candidate = text[:mid].strip()
-        if candidate and _segment_token_length(model, candidate, lang) <= max_tokens:
-            best = mid
-            low = mid + 1
-        else:
-            high = mid - 1
-
-    cut = max(1, best)
-    punctuation = " \t\r\n.,;:!?"
-    min_cut = max(1, cut // 2)
-    for index in range(cut - 1, min_cut - 1, -1):
-        if text[index] in punctuation:
-            cut = index + 1
-            break
-
-    first = text[:cut].strip()
-    rest = text[cut:].strip()
-    return first, rest
-
-
 def _vllm_stream_segments(
     model: Any,
     text: str,
     lang: str,
-    remaining_max_text_tokens: int,
+    max_text_tokens: int,
 ) -> list[str]:
-    first_limit = VLLM_STREAM_FIRST_SEGMENT_TOKENS
-    first_pass_segments = _segment_text_for_limit(
+    return _segment_text_for_limit(
         model,
         text,
         lang,
-        first_limit,
-        strict=True,
+        int(max_text_tokens),
+        strict=False,
     )
-    first_segment = first_pass_segments[0].strip() if first_pass_segments else ""
-
-    if first_segment and _segment_token_length(model, first_segment, lang) <= first_limit:
-        rest_text = _remaining_text_after_first_segment(
-            text,
-            first_segment,
-            first_pass_segments,
-        )
-    else:
-        first_segment, rest_text = _split_first_segment_by_limit(
-            model,
-            text,
-            lang,
-            first_limit,
-        )
-
-    segments = [first_segment] if first_segment else []
-    if rest_text:
-        segments.extend(
-            _segment_text_for_limit(
-                model,
-                rest_text,
-                lang,
-                int(remaining_max_text_tokens),
-                strict=False,
-            )
-        )
-    if not segments:
-        segments = [text]
-    return segments
 
 
 def _stream_playback_chunk(
@@ -829,6 +730,22 @@ def _gradio_audio_chunk(audio: torch.Tensor, sample_rate: int) -> tuple[int, Any
     return sample_rate, data
 
 
+def _begin_stream_generation() -> int:
+    global STREAM_GENERATION_ID
+    with STREAM_GENERATION_LOCK:
+        STREAM_GENERATION_ID += 1
+        return STREAM_GENERATION_ID
+
+
+def _cancel_stream_generation() -> int:
+    return _begin_stream_generation()
+
+
+def _is_current_stream_generation(generation_id: int) -> bool:
+    with STREAM_GENERATION_LOCK:
+        return generation_id == STREAM_GENERATION_ID
+
+
 def _save_wav_snapshot(
     output: Path,
     audio: torch.Tensor,
@@ -871,8 +788,8 @@ def _format_vllm_stream_status(
             f"in {request_elapsed:.2f}s on {SERVE_DEVICE}."
         ),
         (
-            f"first_segment_token_limit={VLLM_STREAM_FIRST_SEGMENT_TOKENS}, "
-            f"remaining_segment_token_limit={int(max_text_tokens)}, "
+            f"segment_token_limit={int(max_text_tokens)}, "
+            f"stream_format=mp3, "
             f"semantic_tokens={semantic_tokens}"
         ),
         f"{'wav' if complete else 'partial_wav'}={output}",
@@ -923,6 +840,7 @@ def _synthesize_vllm_streaming(
 ) -> Iterator[tuple[Any, Any, str]]:
     from confuciustts.utils.audio_post import cross_fade_concat
 
+    generation_id = _begin_stream_generation()
     model = _vllm_model()
     timings: Optional[OrderedDict[str, float]] = (
         OrderedDict() if SERVE_DETAILED_TIMINGS else None
@@ -935,6 +853,8 @@ def _synthesize_vllm_streaming(
     started = time.perf_counter()
 
     with (SERVE_STREAM_SEMAPHORE or nullcontext()):
+        if not _is_current_stream_generation(generation_id):
+            return
         with torch.inference_mode():
             normalized_text = _timed_call(
                 model,
@@ -984,6 +904,8 @@ def _synthesize_vllm_streaming(
                 zip(segments, segment_duration_targets),
                 start=1,
             ):
+                if not _is_current_stream_generation(generation_id):
+                    return
                 segment_started = time.perf_counter()
                 audio, semantic_tokens = model._synth_segment(
                     segment,
@@ -1005,6 +927,8 @@ def _synthesize_vllm_streaming(
                     timings=timings,
                 )
                 segment_elapsed = time.perf_counter() - segment_started
+                if not _is_current_stream_generation(generation_id):
+                    return
                 semantic_token_total += semantic_tokens
                 if audio.dim() == 1:
                     audio = audio.unsqueeze(0)
@@ -1250,6 +1174,7 @@ def synthesize_vllm_stream(
 
 
 def stop_vllm_stream() -> str:
+    _cancel_stream_generation()
     return (
         "Streaming generation stop requested. The current segment may finish, "
         "but remaining queued segments are cancelled."
@@ -1325,6 +1250,7 @@ def build_demo() -> gr.Blocks:
                 stream_audio = gr.Audio(
                     label="vLLM streaming preview",
                     type="numpy",
+                    format="mp3",
                     streaming=True,
                     autoplay=True,
                 )
@@ -1364,6 +1290,8 @@ def build_demo() -> gr.Blocks:
                 *generation_inputs,
             ],
             outputs=[stream_audio, stream_file, stream_status],
+            trigger_mode="multiple",
+            concurrency_limit=None,
         )
         stop_stream_btn.click(
             fn=stop_vllm_stream,
