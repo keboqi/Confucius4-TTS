@@ -13,7 +13,7 @@ HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
 DEVICE="${DEVICE:-cuda}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.25}"
-WARMUP="${WARMUP:-0}"
+WARMUP="${WARMUP:-background}"
 INSTALL_FFMPEG="${INSTALL_FFMPEG:-1}"
 INSTALL_UV="${INSTALL_UV:-1}"
 INSTALL_FLASH_ATTN="${INSTALL_FLASH_ATTN:-1}"
@@ -164,8 +164,11 @@ start_fastapi() {
     )
 
     case "${WARMUP}" in
-        1|true|yes|on)
-            server_args+=(--warmup)
+        1|true|yes|on|background)
+            server_args+=(--warmup --warmup-mode background)
+            ;;
+        foreground|blocking)
+            server_args+=(--warmup --warmup-mode foreground)
             ;;
         0|false|no|off)
             server_args+=(--no-warmup)
@@ -173,7 +176,7 @@ start_fastapi() {
         auto)
             ;;
         *)
-            printf 'WARMUP must be one of: auto, 1, 0.\n' >&2
+            printf 'WARMUP must be one of: background, foreground, auto, 1, 0.\n' >&2
             exit 1
             ;;
     esac

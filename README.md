@@ -158,16 +158,17 @@ bash scripts/run_fastapi_uv.sh
 The script creates an isolated `.venv-fastapi` with `uv`, installs the same CUDA
 and vLLM stack used by the Gradio quick start, converts `checkpoints/t2s-vllm`
 when it is missing, then starts `fastapi_app.py` on `0.0.0.0:8000`. Startup
-warmup is disabled by default so the HTTP service becomes available as soon as
-the model is loaded; set `WARMUP=1` when you prefer a slower startup and faster
-first synthesis request. This keeps the backend TTS service dependencies out of
-the host Python environment.
+warmup runs in the background by default, so the HTTP service becomes available
+as soon as the model is loaded while the server still prewarms itself for later
+requests. This keeps the backend TTS service dependencies out of the host
+Python environment.
 
 Common overrides:
 
 ```bash
 HOST=127.0.0.1 PORT=8010 VENV_DIR=.venv-confucius-api bash scripts/run_fastapi_uv.sh
-WARMUP=1 bash scripts/run_fastapi_uv.sh
+WARMUP=foreground bash scripts/run_fastapi_uv.sh
+WARMUP=0 bash scripts/run_fastapi_uv.sh
 CONVERT_VLLM=1 bash scripts/run_fastapi_uv.sh
 INSTALL_FFMPEG=0 INSTALL_FLASH_ATTN=0 bash scripts/run_fastapi_uv.sh --no-warmup
 ```

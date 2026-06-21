@@ -60,6 +60,7 @@ class ApiSettings:
     compile_cache: bool
     compile_cache_dir: str
     warmup: bool
+    warmup_mode: str
     warmup_prompt_wav: str
     warmup_text: str
     warmup_extra_text: str
@@ -109,6 +110,7 @@ class ApiSettings:
                 "outputs/compile-cache/torchinductor",
             ),
             warmup=serving._env_bool("CONFUCIUS_WARMUP", True),
+            warmup_mode=os.getenv("CONFUCIUS_WARMUP_MODE", "background"),
             warmup_prompt_wav=os.getenv("CONFUCIUS_WARMUP_PROMPT_WAV", "resources/voice.mp3"),
             warmup_text=os.getenv(
                 "CONFUCIUS_WARMUP_TEXT",
@@ -206,6 +208,8 @@ def _configure_serving(settings: ApiSettings) -> None:
         raise ValueError("--s2a-length-bucket-size must be zero or greater.")
     if settings.warmup_diffusion_steps < 1:
         raise ValueError("--warmup-diffusion-steps must be at least 1.")
+    if settings.warmup_mode not in {"background", "foreground"}:
+        raise ValueError("--warmup-mode must be one of: background, foreground.")
     if settings.gpu_stage_concurrency < 1:
         raise ValueError("--gpu-stage-concurrency must be at least 1.")
     if settings.reference_cache_size < 0:
@@ -297,29 +301,51 @@ def _configure_serving(settings: ApiSettings) -> None:
     print("[Confucius4-TTS] FastAPI vLLM-backed TTS model is ready.", flush=True)
 
     if settings.warmup:
-        print("[Confucius4-TTS] Running FastAPI startup warmup generation...", flush=True)
-        warmup_started = time.perf_counter()
-        warmup_ok = serving._warmup_serving_model(
-            serving.SERVE_MODEL,
-            prompt_wav=settings.warmup_prompt_wav,
-            text=settings.warmup_text,
-            lang=settings.warmup_lang,
-            diffusion_steps=settings.warmup_diffusion_steps,
-            cfg_strength=0.7,
-            extra_text=serving._normalize_optional_text(settings.warmup_extra_text),
-        )
-        warmup_status = "completed" if warmup_ok else "finished with errors"
-        print(
-            "[Confucius4-TTS] FastAPI startup warmup "
-            f"{warmup_status} in {time.perf_counter() - warmup_started:.2f}s.",
-            flush=True,
-        )
+        if settings.warmup_mode == "foreground":
+            _run_startup_warmup(settings)
+        else:
+            print(
+                "[Confucius4-TTS] FastAPI startup warmup will run in the "
+                "background after the HTTP service starts.",
+                flush=True,
+            )
     else:
         print(
             "[Confucius4-TTS] FastAPI startup warmup disabled; "
             "the first synthesis request may be slower.",
             flush=True,
         )
+
+
+def _run_startup_warmup(settings: ApiSettings) -> None:
+    print("[Confucius4-TTS] Running FastAPI startup warmup generation...", flush=True)
+    warmup_started = time.perf_counter()
+    warmup_ok = serving._warmup_serving_model(
+        serving.SERVE_MODEL,
+        prompt_wav=settings.warmup_prompt_wav,
+        text=settings.warmup_text,
+        lang=settings.warmup_lang,
+        diffusion_steps=settings.warmup_diffusion_steps,
+        cfg_strength=0.7,
+        extra_text=serving._normalize_optional_text(settings.warmup_extra_text),
+    )
+    warmup_status = "completed" if warmup_ok else "finished with errors"
+    print(
+        "[Confucius4-TTS] FastAPI startup warmup "
+        f"{warmup_status} in {time.perf_counter() - warmup_started:.2f}s.",
+        flush=True,
+    )
+
+
+def _start_background_warmup(settings: ApiSettings) -> threading.Thread:
+    thread = threading.Thread(
+        target=_run_startup_warmup,
+        args=(settings,),
+        name="confucius-fastapi-warmup",
+        daemon=True,
+    )
+    thread.start()
+    return thread
 
 
 def _model() -> Any:
@@ -557,6 +583,8 @@ def create_app(settings: Optional[ApiSettings] = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         _configure_serving(settings)
+        if settings.warmup and settings.warmup_mode == "background":
+            app.state.warmup_thread = _start_background_warmup(settings)
         yield
 
     app = FastAPI(
@@ -695,6 +723,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compile-cache-dir", default=defaults.compile_cache_dir)
     parser.add_argument("--warmup", action=argparse.BooleanOptionalAction,
                         default=defaults.warmup)
+    parser.add_argument("--warmup-mode", default=defaults.warmup_mode,
+                        choices=["background", "foreground"],
+                        help="Run warmup after HTTP startup or block startup until warmup completes.")
     parser.add_argument("--warmup-prompt-wav", default=defaults.warmup_prompt_wav)
     parser.add_argument("--warmup-text", default=defaults.warmup_text)
     parser.add_argument("--warmup-extra-text", default=defaults.warmup_extra_text)
@@ -737,6 +768,7 @@ def _settings_from_args(args: argparse.Namespace) -> ApiSettings:
         compile_cache=args.compile_cache,
         compile_cache_dir=args.compile_cache_dir,
         warmup=args.warmup,
+        warmup_mode=args.warmup_mode,
         warmup_prompt_wav=args.warmup_prompt_wav,
         warmup_text=args.warmup_text,
         warmup_extra_text=args.warmup_extra_text,
