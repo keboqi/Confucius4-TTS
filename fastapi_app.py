@@ -297,7 +297,9 @@ def _configure_serving(settings: ApiSettings) -> None:
     print("[Confucius4-TTS] FastAPI vLLM-backed TTS model is ready.", flush=True)
 
     if settings.warmup:
-        serving._warmup_serving_model(
+        print("[Confucius4-TTS] Running FastAPI startup warmup generation...", flush=True)
+        warmup_started = time.perf_counter()
+        warmup_ok = serving._warmup_serving_model(
             serving.SERVE_MODEL,
             prompt_wav=settings.warmup_prompt_wav,
             text=settings.warmup_text,
@@ -305,6 +307,18 @@ def _configure_serving(settings: ApiSettings) -> None:
             diffusion_steps=settings.warmup_diffusion_steps,
             cfg_strength=0.7,
             extra_text=serving._normalize_optional_text(settings.warmup_extra_text),
+        )
+        warmup_status = "completed" if warmup_ok else "finished with errors"
+        print(
+            "[Confucius4-TTS] FastAPI startup warmup "
+            f"{warmup_status} in {time.perf_counter() - warmup_started:.2f}s.",
+            flush=True,
+        )
+    else:
+        print(
+            "[Confucius4-TTS] FastAPI startup warmup disabled; "
+            "the first synthesis request may be slower.",
+            flush=True,
         )
 
 

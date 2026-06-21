@@ -13,6 +13,7 @@ HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
 DEVICE="${DEVICE:-cuda}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.25}"
+WARMUP="${WARMUP:-0}"
 INSTALL_FFMPEG="${INSTALL_FFMPEG:-1}"
 INSTALL_UV="${INSTALL_UV:-1}"
 INSTALL_FLASH_ATTN="${INSTALL_FLASH_ATTN:-1}"
@@ -153,16 +154,32 @@ convert_vllm_model() {
 start_fastapi() {
     local py
     py="$(venv_python)"
+    local server_args=(
+        --host "${HOST}"
+        --port "${PORT}"
+        --device "${DEVICE}"
+        --config "${CONFIG_PATH}"
+        --vllm-model-dir "${VLLM_MODEL_DIR}"
+        --vllm-gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION}"
+    )
+
+    case "${WARMUP}" in
+        1|true|yes|on)
+            server_args+=(--warmup)
+            ;;
+        0|false|no|off)
+            server_args+=(--no-warmup)
+            ;;
+        auto)
+            ;;
+        *)
+            printf 'WARMUP must be one of: auto, 1, 0.\n' >&2
+            exit 1
+            ;;
+    esac
 
     log "Starting FastAPI backend on ${HOST}:${PORT}"
-    exec "${py}" fastapi_app.py \
-        --host "${HOST}" \
-        --port "${PORT}" \
-        --device "${DEVICE}" \
-        --config "${CONFIG_PATH}" \
-        --vllm-model-dir "${VLLM_MODEL_DIR}" \
-        --vllm-gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION}" \
-        "$@"
+    exec "${py}" fastapi_app.py "${server_args[@]}" "$@"
 }
 
 ensure_uv
