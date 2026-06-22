@@ -42,6 +42,13 @@ class _BackgroundLoop:
         future = asyncio.run_coroutine_threadsafe(coro, self.loop)
         return future.result()
 
+    def close(self) -> None:
+        if self.loop.is_closed():
+            return
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self.thread.join(timeout=5.0)
+        self.loop.close()
+
 
 class Text2SemanticVLLM:
     """Use vLLM for autoregressive semantic token decoding.
@@ -598,6 +605,26 @@ class Text2SemanticVLLM:
         if self._loop is None:
             self._loop = _BackgroundLoop()
         return self._loop.run(self.async_generate_many(requests))
+
+    def close(self) -> None:
+        llm = getattr(self, "llm", None)
+        if llm is not None:
+            for method_name in ("shutdown", "close"):
+                method = getattr(llm, method_name, None)
+                if method is None:
+                    continue
+                with contextlib.suppress(Exception):
+                    result = method()
+                    if inspect.isawaitable(result):
+                        if self._loop is not None:
+                            self._loop.run(result)
+                        else:
+                            asyncio.run(result)
+                    break
+        if self._loop is not None:
+            with contextlib.suppress(Exception):
+                self._loop.close()
+            self._loop = None
 
     async def _abort_request(self, request_id: str) -> None:
         for method_name in ("abort", "abort_request"):

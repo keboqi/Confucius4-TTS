@@ -9,6 +9,7 @@ import base64
 import concurrent.futures
 import contextlib
 import functools
+import gc
 import json
 import os
 import sys
@@ -43,6 +44,8 @@ WARMUP_STATUS = "not_started"
 WARMUP_LAST_ERROR: Optional[str] = None
 WARMUP_LOCK = threading.Lock()
 INFERENCE_EXECUTOR: Optional[concurrent.futures.ThreadPoolExecutor] = None
+SERVING_RELOAD_LOCK = threading.Lock()
+ACTIVE_SETTINGS: Optional["ApiSettings"] = None
 REFERENCE_UPLOAD_SUFFIXES = {".wav", ".mp3", ".flac", ".m4a", ".ogg", ".aac"}
 LANGUAGE_CODES = tuple(
     serving._language_code(choice) for choice in serving.LANGUAGE_CHOICES
@@ -218,7 +221,8 @@ def _resolve_repo_dir_or_path(value: str) -> Path:
 
 
 def _configure_serving(settings: ApiSettings) -> None:
-    global API_OUTPUT_DIR
+    global API_OUTPUT_DIR, ACTIVE_SETTINGS
+    ACTIVE_SETTINGS = settings
 
     if serving.SERVE_MODEL is not None:
         _ensure_inference_executor(settings.inference_workers)
@@ -357,6 +361,77 @@ def _shutdown_inference_executor() -> None:
     if INFERENCE_EXECUTOR is not None:
         INFERENCE_EXECUTOR.shutdown(wait=False, cancel_futures=True)
         INFERENCE_EXECUTOR = None
+
+
+def _exception_chain(exc: BaseException) -> list[BaseException]:
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        chain.append(current)
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return chain
+
+
+def _is_vllm_engine_dead_error(exc: BaseException) -> bool:
+    for item in _exception_chain(exc):
+        class_name = item.__class__.__name__
+        module_name = item.__class__.__module__
+        message = str(item)
+        if class_name == "EngineDeadError":
+            return True
+        if "vllm" in module_name and "EngineDead" in class_name:
+            return True
+        if "EngineCore encountered an issue" in message:
+            return True
+    return False
+
+
+def _is_vllm_generation_timeout(exc: BaseException) -> bool:
+    for item in _exception_chain(exc):
+        if isinstance(item, TimeoutError) and "vLLM T2S generation" in str(item):
+            return True
+    return False
+
+
+def _close_serving_model(model: Any) -> None:
+    close_method = getattr(model, "close", None)
+    if close_method is not None:
+        with contextlib.suppress(Exception):
+            close_method()
+            return
+    t2s_vllm = getattr(model, "t2s_vllm", None)
+    close_vllm = getattr(t2s_vllm, "close", None)
+    if close_vllm is not None:
+        with contextlib.suppress(Exception):
+            close_vllm()
+
+
+def _reload_serving_model_sync(settings: ApiSettings, reason: str) -> None:
+    with SERVING_RELOAD_LOCK:
+        old_model = serving.SERVE_MODEL
+        serving.SERVE_MODEL = None
+        if old_model is not None:
+            print(
+                f"[Confucius4-TTS] Reloading serving model after {reason}; "
+                "closing stale vLLM engine...",
+                flush=True,
+            )
+            _close_serving_model(old_model)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        _configure_serving(settings)
+        print("[Confucius4-TTS] Serving model reload complete.", flush=True)
+
+
+async def _reload_serving_model(reason: str) -> None:
+    settings = ACTIVE_SETTINGS
+    if settings is None:
+        raise RuntimeError("Cannot reload Confucius4-TTS model before settings are configured.")
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _reload_serving_model_sync, settings, reason)
 
 
 def _warmup_requests(settings: ApiSettings) -> list[TTSRequest]:
@@ -644,9 +719,48 @@ async def _run_synthesis(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
+        if _is_vllm_engine_dead_error(exc):
+            traceback.print_exc()
+            print(
+                "[Confucius4-TTS] vLLM engine is dead; reloading and retrying "
+                "request once.",
+                flush=True,
+            )
+            try:
+                await _reload_serving_model("dead vLLM engine")
+                return await _run_inference(
+                    _synthesize_sync,
+                    request,
+                    prompt_wav_override=prompt_wav_override,
+                )
+            except ValueError as retry_value_error:
+                raise HTTPException(
+                    status_code=400,
+                    detail=str(retry_value_error),
+                ) from retry_value_error
+            except Exception as retry_exc:
+                traceback.print_exc()
+                status_code = 503 if isinstance(retry_exc, RuntimeError) else 500
+                raise HTTPException(
+                    status_code=status_code,
+                    detail=(
+                        "vLLM engine was reloaded after failure, but retry failed: "
+                        f"{retry_exc}"
+                    ),
+                ) from retry_exc
+        if _is_vllm_generation_timeout(exc):
+            traceback.print_exc()
+            print(
+                "[Confucius4-TTS] vLLM generation timed out; reloading engine "
+                "before returning error.",
+                flush=True,
+            )
+            with contextlib.suppress(Exception):
+                await _reload_serving_model("vLLM generation timeout")
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
+        if isinstance(exc, RuntimeError):
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 

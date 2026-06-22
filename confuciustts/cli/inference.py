@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import hashlib
 import os
 import sys
@@ -277,6 +278,14 @@ class ConfuciusTTS:
         self.bigvgan.eval().to(self.device)
         for param in self.bigvgan.parameters():
             param.requires_grad = False
+
+    def close(self) -> None:
+        """Release background runtimes owned by this model instance."""
+        t2s_vllm = getattr(self, "t2s_vllm", None)
+        if t2s_vllm is not None and hasattr(t2s_vllm, "close"):
+            with contextlib.suppress(Exception):
+                t2s_vllm.close()
+        self.t2s_vllm = None
 
     def _resolve_use_vllm(self, requested: Optional[bool], model_dir: str) -> bool:
         if requested is not None:
