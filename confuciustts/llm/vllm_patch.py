@@ -41,14 +41,12 @@ def _patch_gpu_model_runner_positions() -> None:
     def _prepare_inputs_with_confucius_positions(
         self,
         scheduler_output,
-        num_scheduled_tokens,
         *args,
         **kwargs,
     ):
         result = current_prepare(
             self,
             scheduler_output,
-            num_scheduled_tokens,
             *args,
             **kwargs,
         )
@@ -61,6 +59,22 @@ def _patch_gpu_model_runner_positions() -> None:
         num_reqs = self.input_batch.num_reqs
         if total <= 0 or num_reqs <= 0:
             return result
+
+        num_scheduled_tokens = None
+        if args:
+            candidate = args[0]
+            if isinstance(candidate, np.ndarray):
+                num_scheduled_tokens = candidate
+        if num_scheduled_tokens is None and isinstance(result, tuple) and len(result) >= 4:
+            candidate = result[3]
+            if isinstance(candidate, np.ndarray):
+                num_scheduled_tokens = candidate
+        if num_scheduled_tokens is None:
+            req_ids_for_tokens = list(self.input_batch.req_ids[:num_reqs])
+            num_scheduled_tokens = np.array(
+                [scheduler_output.num_scheduled_tokens[req_id] for req_id in req_ids_for_tokens],
+                dtype=np.int32,
+            )
 
         req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
         offsets = np.zeros(num_reqs, dtype=np.int64)
