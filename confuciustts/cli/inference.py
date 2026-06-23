@@ -402,12 +402,15 @@ class ConfuciusTTS:
         self,
         prompt_wav: str,
         timings: Optional[OrderedDict[str, float]],
+        cache_prompt_audio: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        with _StepTimer(self, timings, "reference_cache_lookup"):
-            cache_key = self._reference_cache_key(prompt_wav)
-            cached = self._get_cached_reference(cache_key)
-        if cached is not None:
-            return cached
+        cache_key = None
+        if cache_prompt_audio:
+            with _StepTimer(self, timings, "reference_cache_lookup"):
+                cache_key = self._reference_cache_key(prompt_wav)
+                cached = self._get_cached_reference(cache_key)
+            if cached is not None:
+                return cached
 
         with _StepTimer(self, timings, "load_prompt"):
             wav_16k, wav_tgt = self._load_prompt(prompt_wav)
@@ -420,7 +423,8 @@ class ConfuciusTTS:
                 reference_mel = self._ref_mel(wav_tgt)
 
         value = (semantic_features, style_embedding, reference_mel)
-        self._store_cached_reference(cache_key, value)
+        if cache_key is not None:
+            self._store_cached_reference(cache_key, value)
         return value
 
     def _pad_short_prompt_waveform(
@@ -1332,6 +1336,7 @@ class ConfuciusTTS:
         verbose: bool = False,
         use_vllm: Optional[bool] = None,
         return_timings: bool = False,
+        cache_prompt_audio: bool = True,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, Any]]:
         """Generate speech audio from text with voice cloning.
 
@@ -1358,6 +1363,7 @@ class ConfuciusTTS:
             edge_fade_duration: Fade duration at start/end in seconds
             edge_pad_duration: Padding duration at edges in seconds
             verbose: Print processing info
+            cache_prompt_audio: Cache reference prompt conditioning for reuse
 
         Returns:
             Generated audio waveform, shape (1, T_audio) at target sample rate
@@ -1379,6 +1385,7 @@ class ConfuciusTTS:
         semantic_features, style_embedding, reference_mel = self._reference_conditioning(
             prompt_wav,
             timings,
+            cache_prompt_audio=bool(cache_prompt_audio),
         )
 
         # Split long text into segments

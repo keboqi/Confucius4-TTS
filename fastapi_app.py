@@ -180,6 +180,13 @@ class TTSRequest(BaseModel):
     )
     verbose: bool = False
     include_audio_base64: bool = False
+    cache_prompt_audio: bool = Field(
+        True,
+        description=(
+            "Cache reference prompt conditioning for reuse. Set false for "
+            "one-off prompt audio such as per-segment translation clips."
+        ),
+    )
 
 
 class TTSResponse(BaseModel):
@@ -654,6 +661,7 @@ def _synthesize_sync(
         verbose=bool(request.verbose),
         use_vllm=True,
         return_timings=serving.SERVE_DETAILED_TIMINGS,
+        cache_prompt_audio=bool(request.cache_prompt_audio),
     )
     if serving.SERVE_DETAILED_TIMINGS:
         audio, timing_info = result
