@@ -33,6 +33,26 @@ from confuciustts.utils.audio_post import cross_fade_concat
 from confuciustts.utils.text_utils import get_language_token
 
 
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _resolve_min_prompt_audio_seconds() -> float:
+    milliseconds = os.getenv("CONFUCIUS_MIN_PROMPT_AUDIO_MS")
+    if milliseconds is not None:
+        try:
+            return max(0.0, float(milliseconds) / 1000.0)
+        except (TypeError, ValueError):
+            pass
+    return max(0.0, _env_float("CONFUCIUS_MIN_PROMPT_AUDIO_SECONDS", 3.0))
+
+
 class _StepTimer:
     def __init__(
         self,
@@ -175,6 +195,7 @@ class ConfuciusTTS:
         self.reference_cache_size = max(0, int(reference_cache_size or 0))
         self._reference_cache: OrderedDict[tuple[Any, ...], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = OrderedDict()
         self._reference_cache_lock = threading.Lock()
+        self.min_prompt_audio_seconds = _resolve_min_prompt_audio_seconds()
         self.t2s_vllm = None
         self._pytorch_t2s_lock = threading.Lock()
 
@@ -347,6 +368,7 @@ class ConfuciusTTS:
             self.win_length,
             self.fmin,
             self.fmax,
+            self.min_prompt_audio_seconds,
             str(self.device),
         )
 
@@ -400,6 +422,32 @@ class ConfuciusTTS:
         value = (semantic_features, style_embedding, reference_mel)
         self._store_cached_reference(cache_key, value)
         return value
+
+    def _pad_short_prompt_waveform(
+        self,
+        wav: torch.Tensor,
+        sample_rate: int,
+        prompt_wav: str,
+    ) -> torch.Tensor:
+        min_seconds = max(0.0, float(self.min_prompt_audio_seconds or 0.0))
+        if min_seconds <= 0:
+            return wav
+        min_samples = max(1, int(round(min_seconds * sample_rate)))
+        current_samples = int(wav.shape[-1])
+        if current_samples >= min_samples:
+            return wav
+        if current_samples <= 0:
+            raise ValueError(f"Reference audio is empty: {prompt_wav}")
+
+        repeats = (min_samples + current_samples - 1) // current_samples
+        padded = wav.repeat(1, repeats)[..., :min_samples].contiguous()
+        print(
+            "[ConfuciusTTS] Loop-padded short reference audio "
+            f"from {current_samples / sample_rate:.3f}s to {min_samples / sample_rate:.3f}s: "
+            f"{prompt_wav}",
+            flush=True,
+        )
+        return padded
 
     def _resolve_bigvgan_cuda_kernel(self, requested: Optional[bool]) -> bool:
         if self.device.type != "cuda":
@@ -539,6 +587,7 @@ class ConfuciusTTS:
         wav, sr = torchaudio.load(prompt_wav)
         if wav.shape[0] > 1:
             wav = wav.mean(dim=0, keepdim=True)
+        wav = self._pad_short_prompt_waveform(wav, sr, prompt_wav)
         wav_16k = wav if sr == 16000 else torchaudio.functional.resample(wav, sr, 16000)
         wav_tgt = wav if sr == self.sample_rate else torchaudio.functional.resample(wav, sr, self.sample_rate)
         return wav_16k, wav_tgt
