@@ -13,6 +13,7 @@ HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
 DEVICE="${DEVICE:-cuda}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.25}"
+NVFP4="${CONFUCIUS_NVFP4:-0}"
 WARMUP="${WARMUP:-background}"
 INSTALL_FFMPEG="${INSTALL_FFMPEG:-1}"
 INSTALL_UV="${INSTALL_UV:-1}"
@@ -103,6 +104,13 @@ install_python_dependencies() {
 
     log "Installing vLLM requirements and editable Confucius4-TTS package"
     "${UV_BIN}" pip install --python "${py}" -r requirements-vllm.txt
+
+    case "${NVFP4}" in
+        1|true|yes|on)
+            log "Installing optional NVFP4 dependencies"
+            "${UV_BIN}" pip install --python "${py}" -r requirements-nvfp4.txt
+            ;;
+    esac
 
     log "Pinning numpy below 2 for the current stack"
     "${UV_BIN}" pip install --python "${py}" "numpy<2"

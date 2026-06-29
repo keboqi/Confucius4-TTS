@@ -171,7 +171,13 @@ WARMUP=foreground bash scripts/run_fastapi_uv.sh
 WARMUP=0 bash scripts/run_fastapi_uv.sh
 CONVERT_VLLM=1 bash scripts/run_fastapi_uv.sh
 INSTALL_FFMPEG=0 INSTALL_FLASH_ATTN=0 bash scripts/run_fastapi_uv.sh --no-warmup
+CONFUCIUS_NVFP4=1 bash scripts/run_fastapi_uv.sh --nvfp4
 ```
+
+`--nvfp4` is an experimental RTX PRO 6000/B100/B200 Blackwell path. The launcher
+installs `requirements-nvfp4.txt`, packs only S2A DiT attention/FFN linears with
+TorchAO NVFP4, keeps sensitive and non-GEMM operations in BF16, and forces
+`torch.compile`. It does not overwrite `s2a_model.pt`.
 
 JSON response with an output path and download URL:
 

@@ -66,6 +66,7 @@ class ApiSettings:
     vllm_latent_mode: str
     vllm_hidden_states_dir: str
     compile_s2a: Optional[bool]
+    nvfp4: bool
     use_bigvgan_cuda_kernel: Optional[bool]
     s2a_dtype: str
     s2a_sdpa_backend: str
@@ -111,6 +112,7 @@ class ApiSettings:
                 "CONFUCIUS_USE_TORCH_COMPILE",
                 "CONFUCIUS_COMPILE_S2A",
             ),
+            nvfp4=serving._env_bool("CONFUCIUS_NVFP4", False),
             use_bigvgan_cuda_kernel=serving._env_optional_bool(
                 "CONFUCIUS_USE_BIGVGAN_CUDA_KERNEL",
                 "CONFUCIUS_BIGVGAN_USE_CUDA_KERNEL",
@@ -271,6 +273,7 @@ def _configure_serving(settings: ApiSettings) -> None:
     serving.SERVE_T2S_CHECKPOINT = t2s_checkpoint
     serving.SERVE_DEVICE = serve_device
     serving.SERVE_COMPILE_S2A = settings.compile_s2a
+    serving.SERVE_NVFP4 = bool(settings.nvfp4)
     serving.SERVE_USE_BIGVGAN_CUDA_KERNEL = settings.use_bigvgan_cuda_kernel
     serving.SERVE_S2A_DTYPE = settings.s2a_dtype
     serving.SERVE_S2A_SDPA_BACKEND = settings.s2a_sdpa_backend
@@ -304,6 +307,7 @@ def _configure_serving(settings: ApiSettings) -> None:
         "[Confucius4-TTS] Loading FastAPI vLLM T2S backend "
         f"from {vllm_model_dir} on {serve_device} "
         f"(compile_s2a={compile_s2a_label}, "
+        f"nvfp4={settings.nvfp4}, "
         f"use_bigvgan_cuda_kernel={bigvgan_kernel_label}, "
         f"vllm_prefix_mode={settings.vllm_prefix_mode}, "
         f"vllm_latent_mode={settings.vllm_latent_mode}, "
@@ -331,6 +335,7 @@ def _configure_serving(settings: ApiSettings) -> None:
         vllm_latent_mode=settings.vllm_latent_mode,
         vllm_hidden_states_dir=vllm_hidden_states_dir,
         compile_s2a=settings.compile_s2a,
+        nvfp4=settings.nvfp4,
         use_bigvgan_cuda_kernel=settings.use_bigvgan_cuda_kernel,
         s2a_dtype=settings.s2a_dtype,
         s2a_sdpa_backend=settings.s2a_sdpa_backend,
@@ -1377,6 +1382,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compile-s2a", "--use-torch-compile", "--use_torch_compile",
                         action=argparse.BooleanOptionalAction, dest="compile_s2a",
                         default=defaults.compile_s2a)
+    parser.add_argument("--nvfp4", action=argparse.BooleanOptionalAction,
+                        default=defaults.nvfp4,
+                        help="Selectively quantize S2A DiT attention/FFN linears to Blackwell NVFP4.")
     parser.add_argument("--use-bigvgan-cuda-kernel", action=argparse.BooleanOptionalAction,
                         default=defaults.use_bigvgan_cuda_kernel)
     parser.add_argument("--s2a-dtype", default=defaults.s2a_dtype,
@@ -1431,6 +1439,7 @@ def _settings_from_args(args: argparse.Namespace) -> ApiSettings:
         vllm_latent_mode=args.vllm_latent_mode,
         vllm_hidden_states_dir=args.vllm_hidden_states_dir,
         compile_s2a=args.compile_s2a,
+        nvfp4=args.nvfp4,
         use_bigvgan_cuda_kernel=args.use_bigvgan_cuda_kernel,
         s2a_dtype=args.s2a_dtype,
         s2a_sdpa_backend=args.s2a_sdpa_backend,

@@ -29,6 +29,7 @@ SERVE_DEVICE = "cuda"
 SERVE_CONFIG_PATH: Optional[str] = None
 SERVE_T2S_CHECKPOINT: Optional[str] = None
 SERVE_COMPILE_S2A: Optional[bool] = None
+SERVE_NVFP4 = False
 SERVE_USE_BIGVGAN_CUDA_KERNEL: Optional[bool] = None
 SERVE_S2A_DTYPE = "auto"
 SERVE_S2A_SDPA_BACKEND = "auto"
@@ -192,6 +193,7 @@ def _load_serving_model(
     vllm_latent_mode: str,
     vllm_hidden_states_dir: Optional[str],
     compile_s2a: Optional[bool],
+    nvfp4: bool,
     use_bigvgan_cuda_kernel: Optional[bool],
     s2a_dtype: str,
     s2a_sdpa_backend: str,
@@ -224,6 +226,7 @@ def _load_serving_model(
         vllm_latent_mode=vllm_latent_mode,
         vllm_hidden_states_dir=vllm_hidden_states_dir,
         compile_s2a=compile_s2a,
+        nvfp4=nvfp4,
         use_cuda_kernel=use_bigvgan_cuda_kernel,
         s2a_dtype=s2a_dtype,
         s2a_sdpa_backend=s2a_sdpa_backend,
@@ -1391,6 +1394,9 @@ def parse_args() -> argparse.Namespace:
                             "CONFUCIUS_COMPILE_S2A",
                         ),
                         help="Compile the S2A diffusion estimator with torch.compile. Defaults to enabled on CUDA.")
+    parser.add_argument("--nvfp4", action=argparse.BooleanOptionalAction,
+                        default=_env_bool("CONFUCIUS_NVFP4", False),
+                        help="Selectively quantize S2A DiT attention/FFN linears to Blackwell NVFP4.")
     parser.add_argument("--use-bigvgan-cuda-kernel", action=argparse.BooleanOptionalAction,
                         default=_env_optional_bool(
                             "CONFUCIUS_USE_BIGVGAN_CUDA_KERNEL",
@@ -1453,7 +1459,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    global SERVE_COMPILE_S2A, SERVE_CONFIG_PATH, SERVE_DEVICE, SERVE_MODEL
+    global SERVE_COMPILE_S2A, SERVE_NVFP4, SERVE_CONFIG_PATH, SERVE_DEVICE, SERVE_MODEL
     global SERVE_T2S_CHECKPOINT, SERVE_USE_BIGVGAN_CUDA_KERNEL
     global SERVE_PROFILE_CUDA, SERVE_PROFILE_DIR, SERVE_S2A_DTYPE
     global SERVE_S2A_LENGTH_BUCKET_SIZE, SERVE_S2A_SDPA_BACKEND
@@ -1491,6 +1497,7 @@ def main() -> None:
     SERVE_CONFIG_PATH = config_path
     SERVE_T2S_CHECKPOINT = t2s_checkpoint
     SERVE_COMPILE_S2A = args.compile_s2a
+    SERVE_NVFP4 = bool(args.nvfp4)
     SERVE_USE_BIGVGAN_CUDA_KERNEL = args.use_bigvgan_cuda_kernel
     SERVE_S2A_DTYPE = args.s2a_dtype
     SERVE_S2A_SDPA_BACKEND = args.s2a_sdpa_backend
@@ -1520,6 +1527,7 @@ def main() -> None:
         "[Confucius4-TTS] Loading always-on vLLM T2S backend "
         f"from {vllm_model_dir} on {SERVE_DEVICE} "
         f"(compile_s2a={compile_s2a_label}, "
+        f"nvfp4={SERVE_NVFP4}, "
         f"use_bigvgan_cuda_kernel={bigvgan_kernel_label}, "
         f"vllm_prefix_mode={SERVE_VLLM_PREFIX_MODE}, "
         f"vllm_latent_mode={SERVE_VLLM_LATENT_MODE}, "
@@ -1545,6 +1553,7 @@ def main() -> None:
         vllm_latent_mode=args.vllm_latent_mode,
         vllm_hidden_states_dir=vllm_hidden_states_dir,
         compile_s2a=args.compile_s2a,
+        nvfp4=SERVE_NVFP4,
         use_bigvgan_cuda_kernel=args.use_bigvgan_cuda_kernel,
         s2a_dtype=args.s2a_dtype,
         s2a_sdpa_backend=args.s2a_sdpa_backend,

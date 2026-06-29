@@ -151,6 +151,8 @@ class ConfuciusTTS:
         t2s_checkpoint: Optional path to T2S checkpoint (overrides config)
         device: Device for inference ("cuda" or "cpu")
         compile_s2a: Compile the S2A diffusion estimator with torch.compile. None enables it on CUDA.
+        nvfp4: Selectively quantize S2A DiT attention/FFN linears to native
+            Blackwell NVFP4. Forces BF16 and torch.compile.
         use_cuda_kernel: Use BigVGAN's fused CUDA activation kernel. None enables it on CUDA.
     """
     def __init__(
@@ -168,6 +170,7 @@ class ConfuciusTTS:
         vllm_latent_mode: str = "auto",
         vllm_hidden_states_dir: Optional[str] = None,
         compile_s2a: Optional[bool] = None,
+        nvfp4: bool = False,
         use_cuda_kernel: Optional[bool] = None,
         s2a_dtype: str = "auto",
         s2a_sdpa_backend: str = "auto",
@@ -178,9 +181,10 @@ class ConfuciusTTS:
         reference_cache_size: int = 16,
     ):
         self.device = torch.device(device)
-        self.compile_s2a = self._resolve_compile_s2a(compile_s2a)
+        self.nvfp4 = bool(nvfp4)
+        self.compile_s2a = True if self.nvfp4 else self._resolve_compile_s2a(compile_s2a)
         self.use_cuda_kernel = self._resolve_bigvgan_cuda_kernel(use_cuda_kernel)
-        self._s2a_dtype_name = (s2a_dtype or "auto").strip().lower()
+        self._s2a_dtype_name = "bfloat16" if self.nvfp4 else (s2a_dtype or "auto").strip().lower()
         self.s2a_sdpa_backend = self._resolve_s2a_sdpa_backend(s2a_sdpa_backend)
         self.s2a_length_bucket_size = max(0, int(s2a_length_bucket_size or 0))
         self.profile_cuda = bool(profile_cuda)
@@ -290,6 +294,19 @@ class ConfuciusTTS:
         self.s2a_model.set_sdpa_backend(self.s2a_sdpa_backend)
         for param in self.s2a_model.parameters():
             param.requires_grad = False
+        self.nvfp4_layers = ()
+        if self.nvfp4:
+            from confuciustts.flow.nvfp4 import enable_dit_nvfp4
+
+            print("[ConfuciusTTS] Enabling selective NVFP4 for S2A DiT attention/FFN linears...")
+            self.nvfp4_layers = enable_dit_nvfp4(
+                self.s2a_model.decoder.estimator,
+                self.device,
+            )
+            print(
+                f"[ConfuciusTTS] NVFP4 packed {len(self.nvfp4_layers)} S2A DiT linear layers.",
+                flush=True,
+            )
         if self.compile_s2a:
             self._compile_s2a_estimator()
 
@@ -1540,6 +1557,8 @@ def main():
     parser.add_argument("--compile_s2a", "--compile-s2a", "--use_torch_compile", "--use-torch-compile",
                         action=argparse.BooleanOptionalAction, default=None, dest="compile_s2a",
                         help="Compile the S2A diffusion estimator with torch.compile. Defaults to enabled on CUDA.")
+    parser.add_argument("--nvfp4", action=argparse.BooleanOptionalAction, default=False,
+                        help="Selectively quantize S2A DiT attention/FFN linears to Blackwell NVFP4.")
     parser.add_argument("--use_bigvgan_cuda_kernel", "--use-bigvgan-cuda-kernel",
                         action=argparse.BooleanOptionalAction, default=None,
                         help="Use BigVGAN's fused CUDA activation kernel. Defaults to enabled on CUDA.")
@@ -1577,6 +1596,7 @@ def main():
         vllm_latent_mode=args.vllm_latent_mode,
         vllm_hidden_states_dir=args.vllm_hidden_states_dir,
         compile_s2a=args.compile_s2a,
+        nvfp4=args.nvfp4,
         use_cuda_kernel=args.use_bigvgan_cuda_kernel,
         s2a_dtype=args.s2a_dtype,
         s2a_sdpa_backend=args.s2a_sdpa_backend,

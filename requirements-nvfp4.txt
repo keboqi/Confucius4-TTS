@@ -1,0 +1,3 @@
+# Optional native Blackwell NVFP4 path used by --nvfp4.
+torchao==0.16.0
+mslk
