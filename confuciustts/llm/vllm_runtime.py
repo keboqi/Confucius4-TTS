@@ -119,6 +119,7 @@ class Text2SemanticVLLM:
             "enable_mm_embeds": True,
             "async_scheduling": True,
             "skip_tokenizer_init": True,
+            "enable_sleep_mode": True,
         }
         if attention_backend:
             args["attention_backend"] = attention_backend
@@ -135,6 +136,8 @@ class Text2SemanticVLLM:
 
         engine_args = AsyncEngineArgs(**_filter_kwargs(AsyncEngineArgs, args))
         self.llm = AsyncLLM.from_engine_args(engine_args)
+        self._sleeping = False
+        self._sleep_lock = threading.RLock()
 
         try:
             from vllm import TokensPrompt
@@ -597,14 +600,40 @@ class Text2SemanticVLLM:
         return await asyncio.gather(*tasks)
 
     def generate(self, *args: Any, **kwargs: Any):
+        self.wake_up()
         if self._loop is None:
             self._loop = _BackgroundLoop()
         return self._loop.run(self.async_generate(*args, **kwargs))
 
     def generate_many(self, requests: Sequence[Dict[str, Any]]) -> list[Any]:
+        self.wake_up()
         if self._loop is None:
             self._loop = _BackgroundLoop()
         return self._loop.run(self.async_generate_many(requests))
+
+    @property
+    def is_sleeping(self) -> bool:
+        return self._sleeping
+
+    def sleep(self, level: int = 1) -> None:
+        """Release vLLM GPU memory while retaining state for a fast wake."""
+        with self._sleep_lock:
+            if self._sleeping:
+                return
+            if self._loop is None:
+                self._loop = _BackgroundLoop()
+            self._loop.run(self.llm.sleep(level=max(1, min(int(level), 2))))
+            self._sleeping = True
+
+    def wake_up(self) -> None:
+        """Restore a sleeping vLLM engine before inference."""
+        with self._sleep_lock:
+            if not self._sleeping:
+                return
+            if self._loop is None:
+                self._loop = _BackgroundLoop()
+            self._loop.run(self.llm.wake_up())
+            self._sleeping = False
 
     def close(self) -> None:
         llm = getattr(self, "llm", None)

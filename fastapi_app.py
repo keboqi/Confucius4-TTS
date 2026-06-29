@@ -211,6 +211,7 @@ class HealthResponse(BaseModel):
     device: str
     sample_rate: Optional[int]
     vllm_loaded: bool
+    vllm_sleeping: bool
     output_dir: str
     warmup_status: str
     warmup_last_error: Optional[str]
@@ -820,6 +821,7 @@ async def _save_uploaded_reference(upload: UploadFile) -> str:
 
 def _health_payload() -> HealthResponse:
     model = serving.SERVE_MODEL
+    t2s_vllm = None if model is None else getattr(model, "t2s_vllm", None)
     with WARMUP_LOCK:
         warmup_status = WARMUP_STATUS
         warmup_last_error = WARMUP_LAST_ERROR
@@ -829,7 +831,8 @@ def _health_payload() -> HealthResponse:
         model_loaded=model is not None,
         device=serving.SERVE_DEVICE,
         sample_rate=None if model is None else int(model.sample_rate),
-        vllm_loaded=bool(model is not None and getattr(model, "t2s_vllm", None) is not None),
+        vllm_loaded=t2s_vllm is not None,
+        vllm_sleeping=bool(t2s_vllm is not None and getattr(t2s_vllm, "is_sleeping", False)),
         output_dir=str(API_OUTPUT_DIR),
         warmup_status=warmup_status,
         warmup_last_error=warmup_last_error,
@@ -1272,6 +1275,26 @@ def create_app(
     @app.get("/health", response_model=HealthResponse, tags=["meta"])
     async def health() -> HealthResponse:
         return _health_payload()
+
+    @app.post("/v1/models/sleep", tags=["models"])
+    async def sleep_models() -> dict[str, Any]:
+        model = serving.SERVE_MODEL
+        t2s_vllm = None if model is None else getattr(model, "t2s_vllm", None)
+        if t2s_vllm is None:
+            raise HTTPException(status_code=503, detail="Confucius vLLM model is not loaded")
+        await _run_inference(t2s_vllm.sleep, 1)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return {"status": "success", "sleeping": True}
+
+    @app.post("/v1/models/wake", tags=["models"])
+    async def wake_models() -> dict[str, Any]:
+        model = serving.SERVE_MODEL
+        t2s_vllm = None if model is None else getattr(model, "t2s_vllm", None)
+        if t2s_vllm is None:
+            raise HTTPException(status_code=503, detail="Confucius vLLM model is not loaded")
+        await _run_inference(t2s_vllm.wake_up)
+        return {"status": "success", "sleeping": False}
 
     @app.post("/v1/tts", response_model=TTSResponse, tags=["tts"])
     async def synthesize_json(request: TTSRequest) -> TTSResponse:
