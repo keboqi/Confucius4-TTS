@@ -63,8 +63,6 @@ def parse_args():
     p.add_argument("--compile-s2a", "--use-torch-compile", "--use_torch_compile",
                    action=argparse.BooleanOptionalAction, default=None, dest="compile_s2a",
                    help="Compile the S2A diffusion estimator with torch.compile. Defaults to enabled on CUDA")
-    p.add_argument("--nvfp4", action=argparse.BooleanOptionalAction, default=False,
-                   help="Selectively quantize S2A DiT attention/FFN linears to Blackwell NVFP4")
     p.add_argument("--use-bigvgan-cuda-kernel", action=argparse.BooleanOptionalAction,
                    default=None,
                    help="Use BigVGAN's fused CUDA activation kernel. Defaults to enabled on CUDA")
@@ -132,7 +130,6 @@ def main():
         vllm_latent_mode=args.vllm_latent_mode,
         vllm_hidden_states_dir=args.vllm_hidden_states_dir,
         compile_s2a=args.compile_s2a,
-        nvfp4=args.nvfp4,
         use_cuda_kernel=args.use_bigvgan_cuda_kernel,
         s2a_dtype=args.s2a_dtype,
         s2a_sdpa_backend=args.s2a_sdpa_backend,
